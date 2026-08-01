@@ -1,0 +1,327 @@
+//! Byte-preserving document storage.
+//!
+//! Files are not required to be valid UTF-8. Text interpretation belongs to
+//! `Editor` and the renderer, while this layer provides checked byte edits,
+//! line boundaries, dirty tracking, and persistence.
+
+use anyhow::{Context, Result, ensure};
+use std::{
+    fs,
+    io::ErrorKind,
+    ops::Range,
+    path::{Path, PathBuf},
+};
+
+#[derive(Debug)]
+pub struct Document {
+    path: PathBuf,
+    bytes: Vec<u8>,
+    saved_bytes: Vec<u8>,
+    line_ending: LineEnding,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LineEnding {
+    Lf,
+    CrLf,
+}
+
+impl Document {
+    pub fn new(path: PathBuf, bytes: Vec<u8>) -> Self {
+        let saved_bytes = bytes.clone();
+        let line_ending = detect_line_ending(&bytes);
+        Self {
+            path,
+            bytes,
+            saved_bytes,
+            line_ending,
+        }
+    }
+
+    pub fn open(path: PathBuf) -> Result<Self> {
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == ErrorKind::NotFound => Vec::new(),
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to read {}", path.display()));
+            }
+        };
+
+        Ok(Self::new(path, bytes))
+    }
+
+    pub fn insert(&mut self, offset: usize, byte: u8) -> Result<()> {
+        ensure!(
+            offset <= self.bytes.len(),
+            "cannot insert at byte offset {offset}: document length is {}",
+            self.bytes.len()
+        );
+
+        self.bytes.insert(offset, byte);
+        Ok(())
+    }
+
+    pub fn insert_bytes(&mut self, offset: usize, bytes: &[u8]) -> Result<()> {
+        ensure!(
+            offset <= self.bytes.len(),
+            "cannot insert at byte offset {offset}: document length is {}",
+            self.bytes.len()
+        );
+
+        if !bytes.is_empty() {
+            self.bytes.splice(offset..offset, bytes.iter().copied());
+        }
+        Ok(())
+    }
+
+    pub fn delete(&mut self, offset: usize) -> Option<u8> {
+        if offset >= self.bytes.len() {
+            return None;
+        }
+
+        Some(self.bytes.remove(offset))
+    }
+
+    pub fn delete_range(&mut self, range: Range<usize>) -> Option<Vec<u8>> {
+        if range.start >= range.end || range.end > self.bytes.len() {
+            return None;
+        }
+
+        Some(self.bytes.drain(range).collect())
+    }
+
+    pub fn save(&mut self) -> Result<()> {
+        bed_file::atomic_write(&self.path, &self.bytes)
+            .with_context(|| format!("failed to write {}", self.path.display()))?;
+        self.saved_bytes.clone_from(&self.bytes);
+        Ok(())
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.bytes != self.saved_bytes
+    }
+
+    pub fn line_count(&self) -> usize {
+        self.bytes.iter().filter(|&&byte| byte == b'\n').count() + 1
+    }
+
+    pub fn line(&self, row: usize) -> Option<&[u8]> {
+        let start = self.line_start_by_row(row)?;
+        let end = self.line_end(start);
+        Some(&self.bytes[start..end])
+    }
+
+    pub(crate) fn line_start(&self, offset: usize) -> usize {
+        let offset = offset.min(self.bytes.len());
+        self.bytes[..offset]
+            .iter()
+            .rposition(|&byte| byte == b'\n')
+            .map_or(0, |newline| newline + 1)
+    }
+
+    pub(crate) fn line_end(&self, offset: usize) -> usize {
+        let offset = offset.min(self.bytes.len());
+        let newline = self.bytes[offset..]
+            .iter()
+            .position(|&byte| byte == b'\n')
+            .map_or(self.bytes.len(), |newline| offset + newline);
+        if newline > offset && self.bytes.get(newline - 1) == Some(&b'\r') {
+            newline - 1
+        } else {
+            newline
+        }
+    }
+
+    pub(crate) fn line_break_end(&self, line_end: usize) -> usize {
+        match self.bytes.get(line_end..) {
+            Some([b'\r', b'\n', ..]) => line_end + 2,
+            Some([b'\n', ..]) => line_end + 1,
+            _ => line_end,
+        }
+    }
+
+    pub(crate) fn preceding_line_break_start(&self, line_start: usize) -> usize {
+        if line_start >= 2 && self.bytes.get(line_start - 2..line_start) == Some(b"\r\n") {
+            line_start - 2
+        } else {
+            line_start.saturating_sub(1)
+        }
+    }
+
+    pub(crate) fn line_ending(&self) -> &'static [u8] {
+        match self.line_ending {
+            LineEnding::Lf => b"\n",
+            LineEnding::CrLf => b"\r\n",
+        }
+    }
+
+    pub(crate) fn line_start_by_row(&self, row: usize) -> Option<usize> {
+        if row == 0 {
+            return Some(0);
+        }
+
+        let mut seen = 0;
+        for (offset, byte) in self.bytes.iter().enumerate() {
+            if *byte == b'\n' {
+                seen += 1;
+                if seen == row {
+                    return Some(offset + 1);
+                }
+            }
+        }
+        None
+    }
+
+    pub(crate) fn restore(&mut self, bytes: Vec<u8>) {
+        self.bytes = bytes;
+    }
+}
+
+fn detect_line_ending(bytes: &[u8]) -> LineEnding {
+    for (offset, byte) in bytes.iter().enumerate() {
+        if *byte == b'\n' {
+            return if offset > 0 && bytes[offset - 1] == b'\r' {
+                LineEnding::CrLf
+            } else {
+                LineEnding::Lf
+            };
+        }
+    }
+
+    if cfg!(windows) {
+        LineEnding::CrLf
+    } else {
+        LineEnding::Lf
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Document;
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    static NEXT_TEMP_FILE: AtomicUsize = AtomicUsize::new(0);
+
+    struct TempFile(PathBuf);
+
+    impl TempFile {
+        fn new() -> Self {
+            let id = NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!("bed-{}-{id}.txt", std::process::id()));
+            Self(path)
+        }
+
+        fn path(&self) -> PathBuf {
+            self.0.clone()
+        }
+    }
+
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    #[test]
+    fn inserts_and_deletes_bytes() {
+        let mut document = Document::new(PathBuf::from("test.txt"), b"abc".to_vec());
+
+        document.insert(1, b'X').unwrap();
+        assert_eq!(document.as_bytes(), b"aXbc");
+        assert!(document.is_dirty());
+
+        assert_eq!(document.delete(2), Some(b'b'));
+        assert_eq!(document.as_bytes(), b"aXc");
+    }
+
+    #[test]
+    fn rejects_edits_beyond_the_document() {
+        let mut document = Document::new(PathBuf::from("test.txt"), b"abc".to_vec());
+
+        assert!(document.insert(4, b'X').is_err());
+        assert_eq!(document.delete(3), None);
+        assert_eq!(document.as_bytes(), b"abc");
+        assert!(!document.is_dirty());
+    }
+
+    #[test]
+    fn opens_edits_and_saves_a_file() {
+        let temp_file = TempFile::new();
+        fs::write(&temp_file.0, b"abc").unwrap();
+
+        let mut document = Document::open(temp_file.path()).unwrap();
+        assert!(!document.is_dirty());
+
+        document.insert(document.len(), b'd').unwrap();
+        document.save().unwrap();
+
+        assert_eq!(fs::read(&temp_file.0).unwrap(), b"abcd");
+        assert!(!document.is_dirty());
+    }
+
+    #[test]
+    fn opens_a_missing_path_as_an_empty_document() {
+        let temp_file = TempFile::new();
+
+        let document = Document::open(temp_file.path()).unwrap();
+
+        assert!(document.is_empty());
+        assert!(!document.is_dirty());
+    }
+
+    #[test]
+    fn restored_saved_content_is_not_dirty() {
+        let mut document = Document::new(PathBuf::from("test.txt"), b"abc".to_vec());
+        document.insert(document.len(), b'd').unwrap();
+        assert!(document.is_dirty());
+
+        document.restore(b"abc".to_vec());
+
+        assert!(!document.is_dirty());
+    }
+
+    #[test]
+    fn exposes_text_lines() {
+        let document = Document::new(PathBuf::from("test.txt"), b"one\ntwo\n".to_vec());
+
+        assert_eq!(document.line_count(), 3);
+        assert_eq!(document.line(0), Some(b"one".as_slice()));
+        assert_eq!(document.line(1), Some(b"two".as_slice()));
+        assert_eq!(document.line(2), Some(b"".as_slice()));
+        assert_eq!(document.line(3), None);
+    }
+
+    #[test]
+    fn excludes_crlf_separators_from_lines() {
+        let document = Document::new(PathBuf::from("test.txt"), b"one\r\ntwo\r\n".to_vec());
+
+        assert_eq!(document.line_count(), 3);
+        assert_eq!(document.line(0), Some(b"one".as_slice()));
+        assert_eq!(document.line(1), Some(b"two".as_slice()));
+        assert_eq!(document.line(2), Some(b"".as_slice()));
+        assert_eq!(document.line_end(0), 3);
+        assert_eq!(document.line_break_end(3), 5);
+        assert_eq!(document.preceding_line_break_start(5), 3);
+        assert_eq!(document.line_ending(), b"\r\n");
+    }
+}

@@ -1,0 +1,24 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/bed",
+    "crates/bed-core",
+    "crates/bed-file",
+    "crates/bed-terminal",
+    "crates/bed-tui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["softfault <givenyoung46@gmail.com>"]
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1.0.104"
+bed-core = { version = "0.1.0", path = "crates/bed-core" }
+bed-file = { version = "0.1.0", path = "crates/bed-file" }
+bed-terminal = { version = "0.1.0", path = "crates/bed-terminal" }
+bed-tui = { version = "0.1.0", path = "crates/bed-tui" }
+unicode-segmentation = "1.13.3"
+unicode-width = "0.2.2"

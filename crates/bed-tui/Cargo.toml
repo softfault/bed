@@ -1,0 +1,13 @@
+[package]
+name = "bed-tui"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bed-core.workspace = true
+bed-terminal.workspace = true
+unicode-segmentation.workspace = true
+unicode-width.workspace = true
