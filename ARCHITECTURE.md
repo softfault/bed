@@ -36,6 +36,13 @@ Backends are selected at compile time. There is no dynamic backend trait or plat
 - `EditorView` identifies a buffer and owns its cursor and preferred column; stable `ViewId` values allow several views to refer to one buffer.
 - `Editor` coordinates buffers and views, and presents the active view through the editing API.
 
+`RegexPattern` compiles byte-oriented modern regular expressions once and is
+shared by search and substitution. Search wraps across the complete buffer and
+only selects offsets where Normal mode can place a cursor. Substitution is
+line-oriented, preserves native line separators, and expands the regex crate's
+`$0`, `$1`, and `${name}` capture syntax. Command parsing remains in `bed-tui`;
+the core owns matching, replacement, and undo semantics.
+
 Switching views never moves or copies document content. Undo/redo remains buffer-owned, while two split windows showing the same buffer retain independent cursors. Terminal-sized scrolling remains in `bed-tui`; each window associates its views with independent `Viewport` state.
 
 `bed-tui` represents each tab page as a lightweight layout workspace above the global buffer store. A tab has a stable `TabId`, a binary split tree, an active window, recent-window focus history, a stable automatic or explicit title, and file-tree navigation state. Split-tree leaves are stable window IDs; split nodes retain equal or side-anchored cell sizes, clamp them against the recursive minimum size of each child layout, and allocate terminal rectangles without owning editor content. Recent-tab history also uses stable IDs, so reordering tabs does not change close-time focus restoration.
@@ -70,9 +77,10 @@ Unsupported targets fail at compile time instead of silently using an ABI from a
 
 ## Dependencies
 
-The workspace has three external dependencies, all in platform-independent domains outside bed's terminal-backend focus:
+The workspace has four external dependencies, all in platform-independent domains outside bed's terminal-backend focus:
 
 - `anyhow` supplies error context.
+- `regex` provides bounded byte-oriented regular expressions for search and substitution.
 - `unicode-segmentation` implements Unicode grapheme boundaries.
 - `unicode-width` implements terminal display width.
 

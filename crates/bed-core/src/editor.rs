@@ -5,13 +5,32 @@
 //! Each buffer owns its bounded undo and redo history, while cursor navigation
 //! belongs to the active view.
 
-use crate::{Buffer, BufferId, BufferStore, Cursor, Document, EditorView, ViewId};
+use crate::{Buffer, BufferId, BufferStore, Cursor, Document, EditorView, RegexPattern, ViewId};
 use anyhow::{Context, Result};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
 };
 use unicode_segmentation::UnicodeSegmentation;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubstituteRange {
+    CurrentLine,
+    Buffer,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SubstituteOptions {
+    pub global: bool,
+    pub count_only: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SubstituteResult {
+    pub matches: usize,
+    pub lines: usize,
+    pub changed: bool,
+}
 
 #[derive(Debug)]
 pub struct Editor {
@@ -442,12 +461,15 @@ impl Editor {
         Ok(())
     }
 
-    pub fn search_forward(&mut self, query: &str) -> bool {
-        let Some(offset) = find_forward_offset(
-            self.document().as_bytes(),
-            query.as_bytes(),
-            self.view.cursor.offset(),
-        ) else {
+    pub fn search_forward(&mut self, pattern: &RegexPattern) -> bool {
+        let offsets = pattern.matching_offsets(self.document().as_bytes());
+        let cursor = self.view.cursor.offset();
+        let Some(offset) = offsets
+            .iter()
+            .copied()
+            .find(|&offset| offset > cursor)
+            .or_else(|| offsets.first().copied())
+        else {
             return false;
         };
         self.view.cursor.set_offset(offset);
@@ -455,17 +477,116 @@ impl Editor {
         true
     }
 
-    pub fn search_backward(&mut self, query: &str) -> bool {
-        let Some(offset) = find_backward_offset(
-            self.document().as_bytes(),
-            query.as_bytes(),
-            self.view.cursor.offset(),
-        ) else {
+    pub fn search_backward(&mut self, pattern: &RegexPattern) -> bool {
+        let offsets = pattern.matching_offsets(self.document().as_bytes());
+        let cursor = self.view.cursor.offset();
+        let Some(offset) = offsets
+            .iter()
+            .rev()
+            .copied()
+            .find(|&offset| offset < cursor)
+            .or_else(|| offsets.last().copied())
+        else {
             return false;
         };
         self.view.cursor.set_offset(offset);
         self.normalize_normal_cursor();
         true
+    }
+
+    pub fn substitute(
+        &mut self,
+        range: SubstituteRange,
+        pattern: &RegexPattern,
+        replacement: &str,
+        options: SubstituteOptions,
+    ) -> Result<SubstituteResult> {
+        let range = self.substitute_byte_range(range);
+        let source = self.document().as_bytes()[range.clone()].to_vec();
+        let mut output = Vec::with_capacity(source.len());
+        let mut matches = 0usize;
+        let mut lines = 0usize;
+        let mut last_matched_line = None;
+        let mut line_start = 0usize;
+
+        loop {
+            let newline = source[line_start..]
+                .iter()
+                .position(|&byte| byte == b'\n')
+                .map(|offset| line_start + offset);
+            let separator_end = newline.map_or(source.len(), |offset| offset + 1);
+            let content_end = newline.map_or(source.len(), |offset| {
+                if offset > line_start && source[offset - 1] == b'\r' {
+                    offset - 1
+                } else {
+                    offset
+                }
+            });
+            let content = &source[line_start..content_end];
+            let output_line_start = output.len();
+            let mut copied = 0usize;
+            let mut line_matches = 0usize;
+            let mut previous_match_end = None;
+
+            for captures in pattern.captures_iter(content) {
+                let matched = captures
+                    .get(0)
+                    .expect("regular expression captures include the complete match");
+                if matched.is_empty() && previous_match_end == Some(matched.start()) {
+                    continue;
+                }
+                output.extend_from_slice(&content[copied..matched.start()]);
+                captures.expand(replacement.as_bytes(), &mut output);
+                copied = matched.end();
+                previous_match_end = Some(matched.end());
+                matches = matches.saturating_add(1);
+                line_matches = line_matches.saturating_add(1);
+                if !options.global {
+                    break;
+                }
+            }
+            output.extend_from_slice(&content[copied..]);
+            output.extend_from_slice(&source[content_end..separator_end]);
+            if line_matches > 0 {
+                lines = lines.saturating_add(1);
+                last_matched_line = Some(output_line_start);
+            }
+
+            if separator_end == source.len() {
+                break;
+            }
+            line_start = separator_end;
+        }
+
+        if matches == 0 || options.count_only {
+            return Ok(SubstituteResult {
+                matches,
+                lines,
+                changed: false,
+            });
+        }
+
+        let changed = output != source;
+        if changed {
+            self.checkpoint();
+            if !range.is_empty() {
+                self.document_mut()
+                    .delete_range(range.clone())
+                    .expect("validated substitute range must be deletable");
+            }
+            self.document_mut().insert_bytes(range.start, &output)?;
+        }
+        if let Some(last_matched_line) = last_matched_line {
+            self.view
+                .cursor
+                .set_offset((range.start + last_matched_line).min(self.document().len()));
+            self.move_line_start();
+        }
+        Ok(SubstituteResult {
+            matches,
+            lines,
+            changed,
+        })
     }
 
     pub fn move_up(&mut self, allow_line_end: bool) -> bool {
@@ -723,6 +844,17 @@ impl Editor {
         })
     }
 
+    fn substitute_byte_range(&self, range: SubstituteRange) -> std::ops::Range<usize> {
+        match range {
+            SubstituteRange::CurrentLine => {
+                let start = self.document().line_start(self.view.cursor.offset());
+                let end = self.document().line_end(self.view.cursor.offset());
+                start..self.document().line_break_end(end)
+            }
+            SubstituteRange::Buffer => 0..self.document().len(),
+        }
+    }
+
     fn switch_relative_buffer(&mut self, delta: isize) -> bool {
         if self.buffer_order.len() < 2 {
             return false;
@@ -913,57 +1045,14 @@ fn word_end_offset(bytes: &[u8], offset: usize) -> usize {
     position
 }
 
-fn editing_offsets(bytes: &[u8]) -> Vec<usize> {
-    let mut offsets = Vec::new();
-    let mut offset = 0;
-    while offset < bytes.len() {
-        offsets.push(offset);
-        offset = next_grapheme_offset(bytes, offset);
-    }
-    offsets
-}
-
-fn find_forward_offset(bytes: &[u8], query: &[u8], cursor: usize) -> Option<usize> {
-    if query.is_empty() {
-        return None;
-    }
-    let offsets = editing_offsets(bytes);
-    offsets
-        .iter()
-        .copied()
-        .filter(|offset| *offset > cursor)
-        .chain(offsets.iter().copied().filter(|offset| *offset <= cursor))
-        .find(|offset| bytes[*offset..].starts_with(query))
-}
-
-fn find_backward_offset(bytes: &[u8], query: &[u8], cursor: usize) -> Option<usize> {
-    if query.is_empty() {
-        return None;
-    }
-    let offsets = editing_offsets(bytes);
-    offsets
-        .iter()
-        .rev()
-        .copied()
-        .filter(|offset| *offset < cursor)
-        .chain(
-            offsets
-                .iter()
-                .rev()
-                .copied()
-                .filter(|offset| *offset >= cursor),
-        )
-        .find(|offset| bytes[*offset..].starts_with(query))
-}
-
 fn grapheme_count(bytes: &[u8]) -> usize {
     String::from_utf8_lossy(bytes).graphemes(true).count()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Editor;
-    use crate::Document;
+    use super::{Editor, SubstituteOptions, SubstituteRange};
+    use crate::{Document, RegexPattern};
     use std::path::PathBuf;
 
     fn editor_with(bytes: &[u8]) -> Editor {
@@ -1234,14 +1323,107 @@ mod tests {
     #[test]
     fn searches_by_grapheme_boundary_and_wraps() {
         let mut editor = editor_with("one 你好 one".as_bytes());
+        let one = RegexPattern::compile("o.e").unwrap();
 
-        assert!(editor.search_forward("one"));
+        assert!(editor.search_forward(&one));
         assert_eq!(editor.current_line_prefix(), "one 你好 ".as_bytes());
-        assert!(editor.search_forward("one"));
+        assert!(editor.search_forward(&one));
         assert_eq!(editor.cursor().offset(), 0);
-        assert!(editor.search_backward("你好"));
+        assert!(editor.search_backward(&RegexPattern::compile("你.").unwrap()));
         assert_eq!(editor.current_line_prefix(), b"one ");
-        assert!(!editor.search_forward("missing"));
+        assert!(!editor.search_forward(&RegexPattern::compile("missing").unwrap()));
+        assert!(RegexPattern::compile("(").is_err());
+    }
+
+    #[test]
+    fn substitutes_regex_captures_as_one_undoable_change() {
+        let mut editor = editor_with(b"a=1 a=2\r\nb=3");
+        let pattern = RegexPattern::compile("(?P<name>[a-z])=([0-9])").unwrap();
+
+        let result = editor
+            .substitute(
+                SubstituteRange::Buffer,
+                &pattern,
+                "$2:${name}",
+                SubstituteOptions {
+                    global: true,
+                    count_only: false,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(result.matches, 3);
+        assert_eq!(result.lines, 2);
+        assert!(result.changed);
+        assert_eq!(editor.document().as_bytes(), b"1:a 2:a\r\n3:b");
+        assert!(editor.undo());
+        assert_eq!(editor.document().as_bytes(), b"a=1 a=2\r\nb=3");
+    }
+
+    #[test]
+    fn substitutes_once_per_line_and_counts_without_editing() {
+        let mut editor = editor_with(b"a=a=a\nb=b=b");
+        let pattern = RegexPattern::compile("=").unwrap();
+
+        let result = editor
+            .substitute(
+                SubstituteRange::Buffer,
+                &pattern,
+                ":",
+                SubstituteOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(result.matches, 2);
+        assert_eq!(editor.document().as_bytes(), b"a:a=a\nb:b=b");
+
+        let count = editor
+            .substitute(
+                SubstituteRange::Buffer,
+                &RegexPattern::compile("[ab]").unwrap(),
+                "ignored",
+                SubstituteOptions {
+                    global: true,
+                    count_only: true,
+                },
+            )
+            .unwrap();
+        assert_eq!(count.matches, 6);
+        assert!(!count.changed);
+        assert_eq!(editor.document().as_bytes(), b"a:a=a\nb:b=b");
+    }
+
+    #[test]
+    fn substitution_replacement_is_not_vim_compatible() {
+        let mut editor = editor_with(b"x=1");
+        editor
+            .substitute(
+                SubstituteRange::CurrentLine,
+                &RegexPattern::compile("(x)").unwrap(),
+                "&-\\1-$1",
+                SubstituteOptions::default(),
+            )
+            .unwrap();
+
+        assert_eq!(editor.document().as_bytes(), b"&-\\1-x=1");
+    }
+
+    #[test]
+    fn skips_an_empty_global_match_after_a_nonempty_match() {
+        let mut editor = editor_with(b"abc\ndef");
+        let result = editor
+            .substitute(
+                SubstituteRange::Buffer,
+                &RegexPattern::compile(".*").unwrap(),
+                "x",
+                SubstituteOptions {
+                    global: true,
+                    count_only: false,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(result.matches, 2);
+        assert_eq!(editor.document().as_bytes(), b"x\nx");
     }
 
     #[test]

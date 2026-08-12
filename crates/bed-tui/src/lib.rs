@@ -13,8 +13,10 @@
 mod file_tree;
 mod layout;
 
-use anyhow::Result;
-use bed_core::{BufferId, Document, Editor, ViewId};
+use anyhow::{Context, Result};
+use bed_core::{
+    BufferId, Document, Editor, RegexPattern, SubstituteOptions, SubstituteRange, ViewId,
+};
 use bed_terminal::{Key, SpecialKey, TerminalSize};
 use file_tree::{FileTree, TreeEntryKind};
 use layout::{Direction, Layout, Rect, ResizeAmount, SplitAxis, WindowId, window_in_direction};
@@ -90,6 +92,10 @@ enum Command<'a> {
     Tree(Option<&'a str>),
     TreeWidth(Option<&'a str>),
     RefreshTree,
+    Substitute {
+        range: SubstituteRange,
+        expression: &'a str,
+    },
     Unknown(&'a str),
 }
 
@@ -153,7 +159,7 @@ pub struct App {
     mode: Mode,
     command: String,
     search: String,
-    last_search: Option<String>,
+    last_search: Option<RegexPattern>,
     message: String,
     pending: Option<Pending>,
     count: Option<usize>,
@@ -772,11 +778,16 @@ impl App {
                 if query.is_empty() {
                     return;
                 }
-                if !self.editor.search_forward(&query) {
-                    self.message
-                        .push_str(&format!("Pattern not found: {query}"));
+                match RegexPattern::compile(&query) {
+                    Ok(pattern) => {
+                        if !self.editor.search_forward(&pattern) {
+                            self.message
+                                .push_str(&format!("Pattern not found: {query}"));
+                        }
+                        self.last_search = Some(pattern);
+                    }
+                    Err(error) => self.message.push_str(&format!("Search failed: {error:#}")),
                 }
-                self.last_search = Some(query);
             }
             Key::Char(character) if !character.is_control() => self.search.push(character),
             _ => {}
@@ -897,6 +908,7 @@ impl App {
             Command::TreeWidth(Some(value)) => self.set_tree_width_from_command(value),
             Command::TreeWidth(None) => self.message.push_str("File tree width required"),
             Command::RefreshTree => self.refresh_tree(),
+            Command::Substitute { range, expression } => self.execute_substitute(range, expression),
             Command::Empty => {}
             Command::Unknown(command) => self
                 .message
@@ -1875,18 +1887,56 @@ impl App {
     }
 
     fn repeat_search(&mut self, backward: bool) {
-        let Some(query) = self.last_search.as_deref() else {
+        let Some(pattern) = self.last_search.as_ref() else {
             self.message.push_str("No previous search pattern");
             return;
         };
         let found = if backward {
-            self.editor.search_backward(query)
+            self.editor.search_backward(pattern)
         } else {
-            self.editor.search_forward(query)
+            self.editor.search_forward(pattern)
         };
         if !found {
             self.message
-                .push_str(&format!("Pattern not found: {query}"));
+                .push_str(&format!("Pattern not found: {}", pattern.source()));
+        }
+    }
+
+    fn execute_substitute(&mut self, range: SubstituteRange, expression: &str) {
+        let parsed = match parse_substitute_expression(expression) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                self.message
+                    .push_str(&format!("Substitute failed: {error:#}"));
+                return;
+            }
+        };
+        let pattern = match RegexPattern::compile(&parsed.pattern) {
+            Ok(pattern) => pattern,
+            Err(error) => {
+                self.message
+                    .push_str(&format!("Substitute failed: {error:#}"));
+                return;
+            }
+        };
+        match self
+            .editor
+            .substitute(range, &pattern, &parsed.replacement, parsed.options)
+        {
+            Ok(result) if result.matches == 0 => self
+                .message
+                .push_str(&format!("Pattern not found: {}", parsed.pattern)),
+            Ok(result) if parsed.options.count_only => self.message.push_str(&format!(
+                "{} match(es) on {} line(s)",
+                result.matches, result.lines
+            )),
+            Ok(result) => self.message.push_str(&format!(
+                "{} substitution(s) on {} line(s)",
+                result.matches, result.lines
+            )),
+            Err(error) => self
+                .message
+                .push_str(&format!("Substitute failed: {error:#}")),
         }
     }
 
@@ -2037,6 +2087,9 @@ impl App {
 }
 
 fn parse_command(input: &str) -> Command<'_> {
+    if let Some(command) = parse_substitute_command(input) {
+        return command;
+    }
     let mut fields = input.splitn(2, char::is_whitespace);
     let name = fields.next().unwrap_or_default();
     let argument = fields
@@ -2097,6 +2150,90 @@ fn parse_command(input: &str) -> Command<'_> {
         ("treerefresh", None) => Command::RefreshTree,
         _ => Command::Unknown(input),
     }
+}
+
+fn parse_substitute_command(input: &str) -> Option<Command<'_>> {
+    for (prefix, range) in [
+        ("%s", SubstituteRange::Buffer),
+        ("s", SubstituteRange::CurrentLine),
+    ] {
+        let Some(expression) = input.strip_prefix(prefix) else {
+            continue;
+        };
+        if expression.is_empty() || valid_substitute_delimiter(expression) {
+            return Some(Command::Substitute { range, expression });
+        }
+    }
+    None
+}
+
+fn valid_substitute_delimiter(expression: &str) -> bool {
+    expression.chars().next().is_some_and(|delimiter| {
+        delimiter.is_ascii()
+            && !delimiter.is_ascii_alphanumeric()
+            && !delimiter.is_ascii_whitespace()
+            && !matches!(delimiter, '\\' | '"' | '|')
+    })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ParsedSubstitute {
+    pattern: String,
+    replacement: String,
+    options: SubstituteOptions,
+}
+
+fn parse_substitute_expression(expression: &str) -> Result<ParsedSubstitute> {
+    let delimiter = expression
+        .chars()
+        .next()
+        .filter(|_| valid_substitute_delimiter(expression))
+        .context("substitute expression requires a non-alphanumeric delimiter")?;
+    let body = &expression[delimiter.len_utf8()..];
+    let (pattern, remainder, pattern_closed) = take_substitute_field(body, delimiter);
+    anyhow::ensure!(
+        pattern_closed,
+        "substitute pattern requires a closing delimiter"
+    );
+    anyhow::ensure!(!pattern.is_empty(), "substitute pattern cannot be empty");
+    let (replacement, flags, replacement_closed) = take_substitute_field(remainder, delimiter);
+    let flags = if replacement_closed { flags } else { "" };
+
+    let mut options = SubstituteOptions::default();
+    for flag in flags.chars() {
+        match flag {
+            'g' if !options.global => options.global = true,
+            'n' if !options.count_only => options.count_only = true,
+            'g' | 'n' => anyhow::bail!("duplicate substitute flag {flag:?}"),
+            _ => anyhow::bail!("unsupported substitute flag {flag:?}"),
+        }
+    }
+    Ok(ParsedSubstitute {
+        pattern,
+        replacement,
+        options,
+    })
+}
+
+fn take_substitute_field(input: &str, delimiter: char) -> (String, &str, bool) {
+    let mut output = String::with_capacity(input.len());
+    for (offset, character) in input.char_indices() {
+        if character == delimiter {
+            let escaping_backslashes = output
+                .chars()
+                .rev()
+                .take_while(|&char| char == '\\')
+                .count();
+            if escaping_backslashes % 2 == 1 {
+                output.pop();
+                output.push(delimiter);
+                continue;
+            }
+            return (output, &input[offset + character.len_utf8()..], true);
+        }
+        output.push(character);
+    }
+    (output, "", false)
 }
 
 fn parse_resize_amount(value: &str) -> Option<ResizeAmount> {
@@ -2230,9 +2367,10 @@ fn render_line_number(row: usize, exists: bool, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, Command, DEFAULT_FILE_TREE_WIDTH, Mode, SplitAxis, display_width, parse_command,
+        App, Command, DEFAULT_FILE_TREE_WIDTH, Mode, ParsedSubstitute, SplitAxis, display_width,
+        parse_command, parse_substitute_expression,
     };
-    use bed_core::{Document, Editor};
+    use bed_core::{Document, Editor, SubstituteOptions, SubstituteRange};
     use bed_terminal::{Key, TerminalSize};
     use std::path::PathBuf;
 
@@ -3288,12 +3426,16 @@ mod tests {
 
     #[test]
     fn searches_forward_and_repeats_in_both_directions() {
-        let mut app = app_with(b"one two one");
+        let mut app = app_with(b"one two one ONe");
 
         for key in [
             Key::Char('/'),
+            Key::Char('('),
+            Key::Char('?'),
+            Key::Char('i'),
+            Key::Char(')'),
             Key::Char('o'),
-            Key::Char('n'),
+            Key::Char('.'),
             Key::Char('e'),
             Key::Enter,
         ] {
@@ -3301,9 +3443,86 @@ mod tests {
         }
         assert_eq!(app.editor().cursor().offset(), 8);
         app.handle_key(Key::Char('n')).unwrap();
+        assert_eq!(app.editor().cursor().offset(), 12);
+        app.handle_key(Key::Char('n')).unwrap();
         assert_eq!(app.editor().cursor().offset(), 0);
         app.handle_key(Key::Char('N')).unwrap();
+        assert_eq!(app.editor().cursor().offset(), 12);
+    }
+
+    #[test]
+    fn invalid_search_does_not_replace_the_last_pattern() {
+        let mut app = app_with(b"one two one");
+        for key in [
+            Key::Char('/'),
+            Key::Char('o'),
+            Key::Char('.'),
+            Key::Char('e'),
+            Key::Enter,
+        ] {
+            app.handle_key(key).unwrap();
+        }
         assert_eq!(app.editor().cursor().offset(), 8);
+
+        for key in [Key::Char('/'), Key::Char('('), Key::Enter] {
+            app.handle_key(key).unwrap();
+        }
+        assert!(app.message.starts_with("Search failed:"));
+        app.handle_key(Key::Char('n')).unwrap();
+        assert_eq!(app.editor().cursor().offset(), 0);
+    }
+
+    #[test]
+    fn substitutes_captures_and_undoes_as_one_change() {
+        let mut app = app_with(b"a=1 a=2\nb=3");
+
+        execute(&mut app, "%s/(?P<name>[a-z])=([0-9])/$2:${name}/g");
+
+        assert_eq!(app.editor().document().as_bytes(), b"1:a 2:a\n3:b");
+        assert_eq!(app.message, "3 substitution(s) on 2 line(s)");
+        app.handle_key(Key::Char('u')).unwrap();
+        assert_eq!(app.editor().document().as_bytes(), b"a=1 a=2\nb=3");
+    }
+
+    #[test]
+    fn substitute_errors_and_counting_do_not_modify_the_buffer() {
+        let mut app = app_with(b"one one\ntwo");
+
+        execute(&mut app, "%s/o.e/x/gn");
+        assert_eq!(app.message, "2 match(es) on 1 line(s)");
+        assert_eq!(app.editor().document().as_bytes(), b"one one\ntwo");
+
+        execute(&mut app, "%s/(/x/");
+        assert!(app.message.starts_with("Substitute failed:"));
+        assert_eq!(app.editor().document().as_bytes(), b"one one\ntwo");
+    }
+
+    #[test]
+    fn parses_bed_substitute_syntax() {
+        assert_eq!(
+            parse_command("%s#(?i)a\\#b#${name}#gn"),
+            Command::Substitute {
+                range: SubstituteRange::Buffer,
+                expression: "#(?i)a\\#b#${name}#gn",
+            }
+        );
+        assert_eq!(
+            parse_substitute_expression("#(?i)a\\#b#${name}#gn").unwrap(),
+            ParsedSubstitute {
+                pattern: "(?i)a#b".to_owned(),
+                replacement: "${name}".to_owned(),
+                options: SubstituteOptions {
+                    global: true,
+                    count_only: true,
+                },
+            }
+        );
+        assert!(parse_substitute_expression("/a/b/gg").is_err());
+        assert!(parse_substitute_expression("/a/b/i").is_err());
+        assert_eq!(
+            parse_substitute_expression(r"/\\/slash/").unwrap().pattern,
+            r"\\"
+        );
     }
 
     #[test]

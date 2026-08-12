@@ -37,7 +37,7 @@ Normal mode:
 - `i a I A`, `o O`: enter insert mode
 - `x`, `dd`, `dw`, `d$`: delete character, line, word, or to line end
 - `yy`, `yw`, `y$`, `p`, `P`: yank and put characterwise or linewise text
-- `/`, `n`, `N`: search, repeat forward, repeat backward
+- `/PATTERN`, `n`, `N`: regular-expression search, repeat forward, repeat backward
 - `u`, `Ctrl-R`: undo and redo
 - `Ctrl-W` followed by `h`, `j`, `k`, `l`, or `w`: move between split windows
 - `[count] Ctrl-W <` / `>`: decrease/increase the active window width
@@ -63,6 +63,8 @@ Commands:
 - `:buffer N` or `:b N`: switch to buffer number `N`
 - `:buffers` or `:ls`: list open buffers
 - `:edit PATH` or `:e PATH`: open or switch to a path
+- `:s/PATTERN/REPLACEMENT/[FLAGS]`: substitute on the current line
+- `:%s/PATTERN/REPLACEMENT/[FLAGS]`: substitute throughout the buffer
 - `:bdelete [N]` or `:bd [N]`: close a clean buffer; append `!` to discard its changes
 - `:split [PATH]` / `:vsplit [PATH]`: split the active window horizontally/vertically, optionally opening a path in the new window
 - `:close` / `:only`: close the active window or keep only that window in its tab page
@@ -81,6 +83,14 @@ Commands:
 - `:wqall` or `:wqa`: save every buffer and quit
 
 `Ctrl-S` also saves from normal mode.
+
+Search and substitute patterns use the Rust `regex` crate's modern syntax.
+Matching options are written in the pattern, such as `(?i)` for
+case-insensitive matching. Substitute accepts `g` to replace every match on
+each addressed line and `n` to count without changing the buffer. Replacement
+captures use `$0`, `$1`, and `${name}`. `&` and backslash-number forms have no
+special meaning. A substitute is committed as one undoable edit, and malformed
+expressions never partially modify the buffer.
 
 ## Buffers, windows, and tabs
 

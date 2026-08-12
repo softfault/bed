@@ -13,4 +13,5 @@ description = "Editing, document, buffer, view, and history primitives for bed"
 [dependencies]
 anyhow.workspace = true
 bed-file.workspace = true
+regex.workspace = true
 unicode-segmentation.workspace = true

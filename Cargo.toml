@@ -24,5 +24,6 @@ bed-core = { version = "0.1.0", path = "crates/bed-core" }
 bed-file = { version = "0.1.0", path = "crates/bed-file" }
 bed-terminal = { version = "0.1.0", path = "crates/bed-terminal" }
 bed-tui = { version = "0.1.0", path = "crates/bed-tui" }
+regex = "1.13.1"
 unicode-segmentation = "1.13.3"
 unicode-width = "0.2.2"

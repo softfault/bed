@@ -4,6 +4,11 @@ All notable changes to bed are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Modern regular-expression search through `/`, `n`, and `N`.
+- Current-line and whole-buffer substitution with capture expansion, global replacement, count-only mode, and one-step undo.
+
 ## [0.1.0] - 2026-08-12
 
 ### Added
