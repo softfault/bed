@@ -18,7 +18,7 @@ jobs:
     name: Format and Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -33,7 +33,15 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test --workspace --all-targets --locked
+      - name: Test workspace
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --workspace --all-targets --locked 2>&1 | tee cargo-test.log || {
+            message=$(tail -n 200 cargo-test.log | sed ':a;N;$!ba;s/%/%25/g;s/\r/%0D/g;s/\n/%0A/g')
+            echo "::error title=Workspace tests failed::$message"
+            exit 1
+          }
       - run: cargo build --workspace --release --locked
