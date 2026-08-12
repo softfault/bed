@@ -8,6 +8,14 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the backend boundary and platform mat
 
 ## Build and run
 
+Install the released package from crates.io (the installed command is `bed`):
+
+```sh
+cargo install bad-editor
+```
+
+Or build it from source:
+
 ```sh
 cargo build --release
 target/release/bed path/to/file.txt

@@ -11,8 +11,12 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 authors = ["softfault <givenyoung46@gmail.com>"]
 license = "MIT"
+repository = "https://github.com/softfault/bed"
+homepage = "https://github.com/softfault/bed"
+readme = "README.md"
 
 [workspace.dependencies]
 anyhow = "1.0.104"
