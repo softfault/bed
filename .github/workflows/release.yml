@@ -1,0 +1,98 @@
+name: Build Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag (for example, v0.2.0)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            executable: bed
+            archive: tar
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            executable: bed.exe
+            archive: zip
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            executable: bed
+            archive: tar
+          - os: macos-15
+            target: aarch64-apple-darwin
+            executable: bed
+            archive: tar
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Verify tag checkout
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+        run: test "$(git tag --points-at HEAD --list "$TAG")" = "$TAG"
+      - run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Create tar archive
+        if: matrix.archive == 'tar'
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          mkdir dist
+          archive="bed-$TAG-${{ matrix.target }}.tar.gz"
+          tar -czf "dist/$archive" -C "target/${{ matrix.target }}/release" "${{ matrix.executable }}" -C "$GITHUB_WORKSPACE" README.md LICENSE
+          cd dist
+          shasum -a 256 "$archive" > "$archive.sha256"
+      - name: Create zip archive
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          New-Item -ItemType Directory -Path dist
+          $archive = "bed-$env:TAG-${{ matrix.target }}.zip"
+          Compress-Archive -Path "target/${{ matrix.target }}/release/${{ matrix.executable }}", README.md, LICENSE -DestinationPath "dist/$archive"
+          $hash = (Get-FileHash "dist/$archive" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $archive" | Set-Content "dist/$archive.sha256" -Encoding ascii
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  draft:
+    name: Create draft release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: artifacts
+          merge-multiple: true
+      - name: Create GitHub draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: gh release create "$TAG" artifacts/* --draft --verify-tag --generate-notes --title "bed ${TAG#v}"
