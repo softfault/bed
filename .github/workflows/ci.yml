@@ -40,11 +40,8 @@ jobs:
         run: |
           set -o pipefail
           cargo test --workspace --all-targets --locked 2>&1 | tee cargo-test.log || {
-            tail -n 80 cargo-test.log | while IFS= read -r line; do
-              line=${line//'%'/'%25'}
-              line=${line%$'\r'}
-              echo "::error title=Workspace tests failed::$line"
-            done
+            message=$(tail -n 120 cargo-test.log | awk '{ gsub(/%/, "%25"); sub(/\r$/, "%0D"); printf "%s%%0A", $0 }')
+            echo "::error title=Workspace tests failed::$message"
             exit 1
           }
       - run: cargo build --workspace --release --locked
