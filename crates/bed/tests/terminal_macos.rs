@@ -274,6 +274,8 @@ fn restores_a_real_pseudo_terminal_during_panic_unwind() -> io::Result<()> {
     let child = terminal.spawn_command(&mut command)?;
 
     terminal.wait_for_raw_mode()?;
+    terminal.wait_for_output(b"PANIC_READY")?;
+    terminal.write_input(b"x")?;
     terminal.wait_for_output(b"\x1b[?2004l")?;
     let status = child.wait()?;
 
@@ -287,8 +289,9 @@ fn terminal_panic_helper() {
     if std::env::var_os(PANIC_HELPER_ENV).is_none() {
         return;
     }
-    let _terminal = Terminal::new().unwrap();
-    thread::sleep(Duration::from_millis(100));
+    let mut terminal = Terminal::new().unwrap();
+    terminal.draw(b"PANIC_READY").unwrap();
+    terminal.read_key().unwrap();
     panic!("intentional terminal restoration test");
 }
 
