@@ -85,3 +85,8 @@ The workspace has four external dependencies, all in platform-independent domain
 - `unicode-width` implements terminal display width.
 
 There is no platform abstraction dependency. Terminal ABI declarations, mode handling, input translation, and restoration remain part of bed's own terminal layer.
+
+The embedded terminal planned for 0.3.0 will use bed's independently written
+terminal emulator. Its scope and release gates are defined in
+[`docs/terminal-emulator.md`](docs/terminal-emulator.md). The native PTY/ConPTY
+process boundary and terminal-emulation state remain separate components.
