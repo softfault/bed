@@ -15,9 +15,18 @@ use std::{
 #[derive(Debug)]
 pub struct Document {
     path: PathBuf,
+    file_backed: bool,
     bytes: Vec<u8>,
     saved_bytes: Vec<u8>,
+    saved_file_state: SavedFileState,
     line_ending: LineEnding,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SavedFileState {
+    Untracked,
+    Missing,
+    Present,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,22 +41,34 @@ impl Document {
         let line_ending = detect_line_ending(&bytes);
         Self {
             path,
+            file_backed: true,
             bytes,
             saved_bytes,
+            saved_file_state: SavedFileState::Untracked,
             line_ending,
         }
     }
 
+    pub fn scratch() -> Self {
+        let mut document = Self::new(PathBuf::from("[No Name]"), Vec::new());
+        document.file_backed = false;
+        document
+    }
+
     pub fn open(path: PathBuf) -> Result<Self> {
-        let bytes = match fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == ErrorKind::NotFound => Vec::new(),
+        let (bytes, saved_file_state) = match fs::read(&path) {
+            Ok(bytes) => (bytes, SavedFileState::Present),
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                (Vec::new(), SavedFileState::Missing)
+            }
             Err(error) => {
                 return Err(error).with_context(|| format!("failed to read {}", path.display()));
             }
         };
 
-        Ok(Self::new(path, bytes))
+        let mut document = Self::new(path, bytes);
+        document.saved_file_state = saved_file_state;
+        Ok(document)
     }
 
     pub fn insert(&mut self, offset: usize, byte: u8) -> Result<()> {
@@ -91,9 +112,28 @@ impl Document {
     }
 
     pub fn save(&mut self) -> Result<()> {
-        bed_file::atomic_write(&self.path, &self.bytes)
-            .with_context(|| format!("failed to write {}", self.path.display()))?;
+        self.save_impl(false)
+    }
+
+    pub fn save_force(&mut self) -> Result<()> {
+        self.save_impl(true)
+    }
+
+    fn save_impl(&mut self, force: bool) -> Result<()> {
+        ensure!(self.file_backed, "scratch buffer has no file name");
+        if force || self.saved_file_state == SavedFileState::Untracked {
+            bed_file::atomic_write(&self.path, &self.bytes)
+        } else {
+            let expected = match self.saved_file_state {
+                SavedFileState::Missing => None,
+                SavedFileState::Present => Some(self.saved_bytes.as_slice()),
+                SavedFileState::Untracked => unreachable!("handled above"),
+            };
+            bed_file::atomic_write_if_unchanged(&self.path, expected, &self.bytes)
+        }
+        .with_context(|| format!("failed to write {}", self.path.display()))?;
         self.saved_bytes.clone_from(&self.bytes);
+        self.saved_file_state = SavedFileState::Present;
         Ok(())
     }
 
@@ -103,6 +143,10 @@ impl Document {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn is_file_backed(&self) -> bool {
+        self.file_backed
     }
 
     pub fn len(&self) -> usize {
@@ -280,6 +324,55 @@ mod tests {
     }
 
     #[test]
+    fn refuses_to_overwrite_a_file_modified_after_opening() {
+        let temp_file = TempFile::new();
+        fs::write(&temp_file.0, b"original").unwrap();
+        let mut document = Document::open(temp_file.path()).unwrap();
+        document.insert_bytes(document.len(), b" edited").unwrap();
+        fs::write(&temp_file.0, b"external").unwrap();
+
+        let error = document.save().unwrap_err();
+
+        assert!(format!("{error:#}").contains("changed on disk"));
+        assert_eq!(fs::read(&temp_file.0).unwrap(), b"external");
+        assert!(document.is_dirty());
+
+        document.save_force().unwrap();
+        assert_eq!(fs::read(&temp_file.0).unwrap(), b"original edited");
+        assert!(!document.is_dirty());
+    }
+
+    #[test]
+    fn detects_deletion_and_creation_conflicts() {
+        let deleted_file = TempFile::new();
+        fs::write(&deleted_file.0, b"original").unwrap();
+        let mut deleted = Document::open(deleted_file.path()).unwrap();
+        deleted.insert(0, b'X').unwrap();
+        fs::remove_file(&deleted_file.0).unwrap();
+        assert!(format!("{:#}", deleted.save().unwrap_err()).contains("changed on disk"));
+
+        let created_file = TempFile::new();
+        let mut created = Document::open(created_file.path()).unwrap();
+        created.insert_bytes(0, b"mine").unwrap();
+        fs::write(&created_file.0, b"theirs").unwrap();
+        assert!(format!("{:#}", created.save().unwrap_err()).contains("changed on disk"));
+        assert_eq!(fs::read(&created_file.0).unwrap(), b"theirs");
+    }
+
+    #[test]
+    fn permits_a_disk_rewrite_when_the_content_is_unchanged() {
+        let temp_file = TempFile::new();
+        fs::write(&temp_file.0, b"original").unwrap();
+        let mut document = Document::open(temp_file.path()).unwrap();
+        document.insert_bytes(document.len(), b" edited").unwrap();
+        fs::write(&temp_file.0, b"original").unwrap();
+
+        document.save().unwrap();
+
+        assert_eq!(fs::read(&temp_file.0).unwrap(), b"original edited");
+    }
+
+    #[test]
     fn opens_a_missing_path_as_an_empty_document() {
         let temp_file = TempFile::new();
 
@@ -287,6 +380,16 @@ mod tests {
 
         assert!(document.is_empty());
         assert!(!document.is_dirty());
+    }
+
+    #[test]
+    fn scratch_documents_cannot_be_written_to_a_display_label() {
+        let mut document = Document::scratch();
+        document.insert_bytes(0, b"draft").unwrap();
+
+        assert!(!document.is_file_backed());
+        assert!(format!("{:#}", document.save_force().unwrap_err()).contains("no file name"));
+        assert!(document.is_dirty());
     }
 
     #[test]

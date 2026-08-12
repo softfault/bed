@@ -60,13 +60,21 @@ enum Pending {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Command<'a> {
     Empty,
-    Write,
-    WriteAll,
+    Write {
+        force: bool,
+    },
+    WriteAll {
+        force: bool,
+    },
     Quit {
         force: bool,
     },
-    WriteQuit,
-    WriteQuitAll,
+    WriteQuit {
+        force: bool,
+    },
+    WriteQuitAll {
+        force: bool,
+    },
     NextBuffer,
     PreviousBuffer,
     Buffer(Option<&'a str>),
@@ -230,6 +238,14 @@ impl App {
             insert_back_on_unchanged: false,
             should_quit: false,
         }
+    }
+
+    pub fn for_directory(editor: Editor, directory: PathBuf) -> Self {
+        let mut app = Self::new(editor);
+        app.file_tree = FileTree::new(directory);
+        app.active_tab_automatic_title = app.file_tree.root_label();
+        app.mode = Mode::Tree;
+        app
     }
 
     pub fn handle_key(&mut self, key: Key) -> Result<()> {
@@ -667,7 +683,7 @@ impl App {
                 }
             }
             Key::Ctrl('s') => {
-                self.save();
+                self.save(false);
             }
             Key::Paste(_) => self
                 .message
@@ -850,21 +866,21 @@ impl App {
 
     fn execute_command(&mut self, command: &str) {
         match parse_command(command) {
-            Command::Write => {
-                self.save();
+            Command::Write { force } => {
+                self.save(force);
             }
-            Command::WriteAll => {
-                self.save_all();
+            Command::WriteAll { force } => {
+                self.save_all(force);
             }
             Command::Quit { force: true } => self.should_quit = true,
             Command::Quit { force: false } => self.quit_if_clean(),
-            Command::WriteQuit => {
-                if self.save() {
+            Command::WriteQuit { force } => {
+                if self.save(force) {
                     self.quit_if_clean();
                 }
             }
-            Command::WriteQuitAll => {
-                if self.save_all() {
+            Command::WriteQuitAll { force } => {
+                if self.save_all(force) {
                     self.quit_if_clean();
                 }
             }
@@ -1962,8 +1978,13 @@ impl App {
         }
     }
 
-    fn save(&mut self) -> bool {
-        match self.editor.save() {
+    fn save(&mut self, force: bool) -> bool {
+        let result = if force {
+            self.editor.save_force()
+        } else {
+            self.editor.save()
+        };
+        match result {
             Ok(()) => {
                 self.message.push_str(&format!(
                     "{} written ({} bytes)",
@@ -1979,8 +2000,13 @@ impl App {
         }
     }
 
-    fn save_all(&mut self) -> bool {
-        match self.editor.save_all() {
+    fn save_all(&mut self, force: bool) -> bool {
+        let result = if force {
+            self.editor.save_all_force()
+        } else {
+            self.editor.save_all()
+        };
+        match result {
             Ok(written) => {
                 self.message.push_str(&format!("{written} buffers written"));
                 true
@@ -2099,12 +2125,16 @@ fn parse_command(input: &str) -> Command<'_> {
 
     match (name, argument) {
         ("", None) => Command::Empty,
-        ("w", None) => Command::Write,
-        ("wa" | "wall", None) => Command::WriteAll,
+        ("w", None) => Command::Write { force: false },
+        ("w!", None) => Command::Write { force: true },
+        ("wa" | "wall", None) => Command::WriteAll { force: false },
+        ("wa!" | "wall!", None) => Command::WriteAll { force: true },
         ("q" | "qa" | "qall", None) => Command::Quit { force: false },
         ("q!" | "qa!" | "qall!", None) => Command::Quit { force: true },
-        ("wq" | "x", None) => Command::WriteQuit,
-        ("wqa" | "wqall" | "xa" | "xall", None) => Command::WriteQuitAll,
+        ("wq" | "x", None) => Command::WriteQuit { force: false },
+        ("wq!" | "x!", None) => Command::WriteQuit { force: true },
+        ("wqa" | "wqall" | "xa" | "xall", None) => Command::WriteQuitAll { force: false },
+        ("wqa!" | "wqall!" | "xa!" | "xall!", None) => Command::WriteQuitAll { force: true },
         ("bn" | "bnext", None) => Command::NextBuffer,
         ("bp" | "bprevious", None) => Command::PreviousBuffer,
         ("b" | "buffer", argument) => Command::Buffer(argument),
@@ -2372,7 +2402,12 @@ mod tests {
     };
     use bed_core::{Document, Editor, SubstituteOptions, SubstituteRange};
     use bed_terminal::{Key, TerminalSize};
-    use std::path::PathBuf;
+    use std::{
+        path::PathBuf,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    static NEXT_TEST_FILE: AtomicUsize = AtomicUsize::new(0);
 
     fn app_with(bytes: &[u8]) -> App {
         App::new(Editor::new(Document::new(
@@ -3230,6 +3265,30 @@ mod tests {
     }
 
     #[test]
+    fn force_write_overrides_an_external_change() {
+        let path = std::env::temp_dir().join(format!(
+            "bed-force-write-{}-{}.txt",
+            std::process::id(),
+            NEXT_TEST_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, b"original").unwrap();
+        let mut editor = Editor::open(path.clone()).unwrap();
+        editor.insert_bytes(b" edited").unwrap();
+        std::fs::write(&path, b"external").unwrap();
+        let mut app = App::new(editor);
+
+        execute(&mut app, "w");
+        assert!(app.message.contains("changed on disk"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"external");
+
+        execute(&mut app, "w!");
+        assert!(app.message.contains("written"));
+        assert_eq!(std::fs::read(&path).unwrap(), b" editedoriginal");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn edit_opens_a_new_buffer_and_reuses_an_existing_path() {
         let mut app = app_with(b"");
         let path = std::env::temp_dir().join(format!(
@@ -3255,7 +3314,9 @@ mod tests {
             Command::Edit(Some("some path"))
         );
         assert_eq!(parse_command("buffers"), Command::ListBuffers);
-        assert_eq!(parse_command("wall"), Command::WriteAll);
+        assert_eq!(parse_command("wall"), Command::WriteAll { force: false });
+        assert_eq!(parse_command("w!"), Command::Write { force: true });
+        assert_eq!(parse_command("wa!"), Command::WriteAll { force: true });
         assert_eq!(
             parse_command("vsplit"),
             Command::Split(SplitAxis::Columns, None)

@@ -696,7 +696,19 @@ impl Editor {
         self.document_mut().save()
     }
 
+    pub fn save_force(&mut self) -> Result<()> {
+        self.document_mut().save_force()
+    }
+
     pub fn save_all(&mut self) -> Result<usize> {
+        self.save_all_impl(false)
+    }
+
+    pub fn save_all_force(&mut self) -> Result<usize> {
+        self.save_all_impl(true)
+    }
+
+    fn save_all_impl(&mut self, force: bool) -> Result<usize> {
         let mut written = 0;
         for &buffer_id in &self.buffer_order {
             let buffer = self
@@ -704,7 +716,11 @@ impl Editor {
                 .get_mut(buffer_id)
                 .expect("buffer order references a missing buffer");
             if buffer.document().is_dirty() {
-                buffer.document_mut().save()?;
+                if force {
+                    buffer.document_mut().save_force()?;
+                } else {
+                    buffer.document_mut().save()?;
+                }
                 written += 1;
             }
         }
