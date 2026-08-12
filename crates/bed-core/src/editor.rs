@@ -9,6 +9,7 @@ use crate::{Buffer, BufferId, BufferStore, Cursor, Document, EditorView, RegexPa
 use anyhow::{Context, Result};
 use std::{
     collections::HashMap,
+    fs,
     path::{Path, PathBuf},
 };
 use unicode_segmentation::UnicodeSegmentation;
@@ -696,7 +697,19 @@ impl Editor {
         self.document_mut().save()
     }
 
+    pub fn save_force(&mut self) -> Result<()> {
+        self.document_mut().save_force()
+    }
+
     pub fn save_all(&mut self) -> Result<usize> {
+        self.save_all_impl(false)
+    }
+
+    pub fn save_all_force(&mut self) -> Result<usize> {
+        self.save_all_impl(true)
+    }
+
+    fn save_all_impl(&mut self, force: bool) -> Result<usize> {
         let mut written = 0;
         for &buffer_id in &self.buffer_order {
             let buffer = self
@@ -704,7 +717,11 @@ impl Editor {
                 .get_mut(buffer_id)
                 .expect("buffer order references a missing buffer");
             if buffer.document().is_dirty() {
-                buffer.document_mut().save()?;
+                if force {
+                    buffer.document_mut().save_force()?;
+                } else {
+                    buffer.document_mut().save()?;
+                }
                 written += 1;
             }
         }
@@ -837,10 +854,12 @@ impl Editor {
     }
 
     fn buffer_id_for_path(&self, path: &Path) -> Option<BufferId> {
+        let requested = path_identity(path);
         self.buffer_order.iter().copied().find(|&buffer_id| {
-            self.buffers
-                .get(buffer_id)
-                .is_some_and(|buffer| buffer.document().path() == path)
+            self.buffers.get(buffer_id).is_some_and(|buffer| {
+                buffer.document().is_file_backed()
+                    && path_identity(buffer.document().path()) == requested
+            })
         })
     }
 
@@ -1049,11 +1068,62 @@ fn grapheme_count(bytes: &[u8]) -> usize {
     String::from_utf8_lossy(bytes).graphemes(true).count()
 }
 
+fn path_identity(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| lexical_absolute(path))
+}
+
+fn lexical_absolute(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Editor, SubstituteOptions, SubstituteRange};
     use crate::{Document, RegexPattern};
-    use std::path::PathBuf;
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    static NEXT_TEMP_DIR: AtomicUsize = AtomicUsize::new(0);
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let id = NEXT_TEMP_DIR.fetch_add(1, Ordering::Relaxed);
+            let path =
+                std::env::temp_dir().join(format!("bed-editor-paths-{}-{id}", std::process::id()));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     fn editor_with(bytes: &[u8]) -> Editor {
         Editor::new(Document::new(PathBuf::from("test.txt"), bytes.to_vec()))
@@ -1146,6 +1216,53 @@ mod tests {
             editor.open_buffer(PathBuf::from("test.txt")).unwrap(),
             original
         );
+        assert_eq!(editor.buffer_count(), 1);
+    }
+
+    #[test]
+    fn path_aliases_reuse_an_existing_buffer() {
+        let directory = TempDir::new();
+        let path = directory.0.join("file.txt");
+        fs::write(&path, b"one").unwrap();
+        let mut editor = Editor::open(path.clone()).unwrap();
+        let original = editor.buffer_id();
+
+        assert_eq!(
+            editor
+                .open_buffer(directory.0.join(".").join("file.txt"))
+                .unwrap(),
+            original
+        );
+        assert_eq!(editor.buffer_count(), 1);
+    }
+
+    #[test]
+    fn missing_path_aliases_reuse_an_existing_buffer() {
+        let directory = TempDir::new();
+        fs::create_dir(directory.0.join("nested")).unwrap();
+        let path = directory.0.join("missing.txt");
+        let alias = directory.0.join("nested").join("..").join("missing.txt");
+        let mut editor = Editor::open(path).unwrap();
+        let original = editor.buffer_id();
+
+        assert_eq!(editor.open_buffer(alias).unwrap(), original);
+        assert_eq!(editor.buffer_count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symbolic_link_aliases_reuse_an_existing_buffer() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TempDir::new();
+        let path = directory.0.join("file.txt");
+        let alias = directory.0.join("alias.txt");
+        fs::write(&path, b"one").unwrap();
+        symlink(&path, &alias).unwrap();
+        let mut editor = Editor::open(path).unwrap();
+        let original = editor.buffer_id();
+
+        assert_eq!(editor.open_buffer(alias).unwrap(), original);
         assert_eq!(editor.buffer_count(), 1);
     }
 

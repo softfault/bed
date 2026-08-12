@@ -5,7 +5,8 @@ use std::collections::HashMap;
 
 // Snapshot history is deliberately bounded because every entry owns a full
 // document copy.
-const HISTORY_LIMIT: usize = 100;
+const HISTORY_ENTRY_LIMIT: usize = 100;
+const HISTORY_BYTE_LIMIT: usize = 32 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct BufferId(u64);
@@ -126,7 +127,25 @@ impl BufferStore {
 }
 
 fn push_snapshot(history: &mut Vec<Snapshot>, snapshot: Snapshot) {
-    if history.len() == HISTORY_LIMIT {
+    push_snapshot_with_limits(history, snapshot, HISTORY_ENTRY_LIMIT, HISTORY_BYTE_LIMIT);
+}
+
+fn push_snapshot_with_limits(
+    history: &mut Vec<Snapshot>,
+    snapshot: Snapshot,
+    entry_limit: usize,
+    byte_limit: usize,
+) {
+    while !history.is_empty()
+        && (history.len() >= entry_limit
+            || history
+                .iter()
+                .fold(0usize, |total, snapshot| {
+                    total.saturating_add(snapshot.bytes.len())
+                })
+                .saturating_add(snapshot.bytes.len())
+                > byte_limit)
+    {
         history.remove(0);
     }
     history.push(snapshot);
@@ -134,7 +153,7 @@ fn push_snapshot(history: &mut Vec<Snapshot>, snapshot: Snapshot) {
 
 #[cfg(test)]
 mod tests {
-    use super::BufferStore;
+    use super::{BufferStore, Snapshot, push_snapshot_with_limits};
     use crate::Document;
     use std::path::PathBuf;
 
@@ -164,5 +183,31 @@ mod tests {
         assert_eq!(buffers.get(first).unwrap().document().as_bytes(), b"one");
         assert_eq!(buffers.get(second).unwrap().document().as_bytes(), b"two");
         assert_eq!(buffers.get_mut(second).unwrap().undo(0), None);
+    }
+
+    #[test]
+    fn snapshot_history_is_bounded_by_total_bytes() {
+        let mut history = Vec::new();
+        push_snapshot_with_limits(
+            &mut history,
+            Snapshot {
+                bytes: vec![1; 6],
+                cursor: 0,
+            },
+            100,
+            10,
+        );
+        push_snapshot_with_limits(
+            &mut history,
+            Snapshot {
+                bytes: vec![2; 6],
+                cursor: 0,
+            },
+            100,
+            10,
+        );
+
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].bytes, vec![2; 6]);
     }
 }

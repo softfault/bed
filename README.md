@@ -20,11 +20,12 @@ Or build it from source:
 cargo build --release
 target/release/bed path/to/file.txt
 target/release/bed first.txt second.txt
+target/release/bed path/to/directory
 ```
 
 Linux x86_64 and Windows x86_64 are runtime-tested. Linux aarch64, macOS x86_64/aarch64, FreeBSD x86_64, and NetBSD x86_64 are cross-checked but still require native validation. OpenBSD is not yet supported.
 
-Each path opens in its own buffer. If a path does not exist, `bed` starts that buffer empty and creates the file on `:w`.
+Each file path opens in its own buffer. If a path does not exist, `bed` starts that buffer empty and creates the file on `:w`. Starting without a path opens the current directory in the file tree; passing a directory opens that directory directly.
 
 ## Keys
 
@@ -57,8 +58,8 @@ Insert mode:
 
 Commands:
 
-- `:w`: save
-- `:wall` or `:wa`: save every modified buffer
+- `:w`: save unless the file changed externally; `:w!` explicitly overwrites it
+- `:wall` or `:wa`: save every modified buffer; append `!` to explicitly overwrite external changes
 - `:bnext` / `:bprevious` (`:bn` / `:bp`): switch buffers
 - `:buffer N` or `:b N`: switch to buffer number `N`
 - `:buffers` or `:ls`: list open buffers
@@ -102,7 +103,7 @@ The tab line is always present above the editor area. Only the active tab is hig
 
 ## File tree
 
-On terminals at least 40 columns wide, bed keeps a file tree at the left edge. Its initial root is the directory containing the first startup path, and the header shows that directory's name. Each tab retains its own root, expanded directories, selection, and scroll position; the panel width is a global UI preference shared by all tabs. The panel uses only the standard library filesystem API and keeps exact platform-native paths internally.
+On terminals at least 40 columns wide, bed keeps a file tree at the left edge. Its initial root is the first startup directory, or the directory containing the first startup file, and the header shows that directory's name. Each tab retains its own root, expanded directories, selection, and scroll position; the panel width is a global UI preference shared by all tabs. The panel uses only the standard library filesystem API and keeps exact platform-native paths internally.
 
 - `Ctrl-N`: enter or leave the file tree
 - `Ctrl-W l` or `Ctrl-W w`: return to the previously active editor window
