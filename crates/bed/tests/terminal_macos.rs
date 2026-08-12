@@ -169,6 +169,12 @@ impl PseudoTerminal {
         wait_until(|| {
             self.read_available(&mut output)?;
             Ok(contains(&output, needle))
+        })
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("terminal output did not contain {needle:?}: {error}"),
+            )
         })?;
         Ok(output)
     }
@@ -273,7 +279,6 @@ fn restores_a_real_pseudo_terminal_during_panic_unwind() -> io::Result<()> {
         .env(PANIC_HELPER_ENV, "1");
     let child = terminal.spawn_command(&mut command)?;
 
-    terminal.wait_for_raw_mode()?;
     terminal.wait_for_output(b"PANIC_READY")?;
     terminal.write_input(b"x")?;
     terminal.wait_for_output(b"\x1b[?2004l")?;
