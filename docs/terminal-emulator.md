@@ -71,3 +71,8 @@ The embedded terminal remains pre-release until:
 - Windows x86_64 has native ConPTY validation;
 - other native targets are documented accurately as preview or runtime-tested;
 - no patched or vendored terminal-emulator dependency remains in release packages.
+
+Workspace publishing must follow dependency order: publish `bed-vt100` before
+`bed-terminal` and `bed-pty`, then publish the application crates. Until
+`bed-vt100` exists in the registry, Cargo can list the dependent package
+contents but cannot prepare or verify those crates for upload in isolation.

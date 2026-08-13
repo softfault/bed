@@ -7,6 +7,7 @@
 
 use anyhow::{Context, Result, bail, ensure};
 use bed_pty::{PtyProcess, PtySize};
+use bed_terminal::{Key, encode_child_key};
 use bed_vt100::TerminalEmulator;
 use std::{
     io::{Read, Write},
@@ -108,6 +109,46 @@ fn routes_terminal_responses_through_a_real_pty() -> Result<()> {
         terminal.screen().contents()
     );
     ensure!(pty.wait()?.success(), "response-check child failed");
+    Ok(())
+}
+
+#[test]
+fn encodes_mode_dependent_input_for_a_real_pty() -> Result<()> {
+    let mut command = Command::new("/bin/sh");
+    command.args([
+        "-c",
+        concat!(
+            "stty raw -echo; ",
+            "bytes=$(dd bs=1 count=22 2>/dev/null | od -An -tx1 | tr -d ' \\n'); ",
+            "case \"$bytes\" in ",
+            "1b4f411b5b3230307e6f6e650a74776f1b5b3230317e) ",
+            "printf '\\r\\nINPUT_OK\\r\\n' ;; ",
+            "*) printf '\\r\\nINPUT_BAD:%s\\r\\n' \"$bytes\"; exit 1 ;; ",
+            "esac"
+        ),
+    ]);
+    let mut pty = PtyProcess::spawn(&mut command, PtySize::new(6, 30)?)?;
+    let output = spawn_reader(pty.try_clone_reader()?);
+    let mut terminal = TerminalEmulator::new(6, 30, 0);
+    terminal.process(b"\x1b[?1h\x1b[?2004h");
+
+    pty.write_all(&encode_child_key(&Key::ArrowUp, terminal.modes()))?;
+    pty.write_all(&encode_child_key(
+        &Key::Paste("one\ntwo".to_owned()),
+        terminal.modes(),
+    ))?;
+    pty.flush()?;
+
+    let mut raw = Vec::new();
+    read_and_process_until(&output, &mut raw, &mut terminal, |terminal| {
+        terminal.screen().contents().contains("INPUT_OK")
+    })?;
+    ensure!(
+        terminal.screen().contents().contains("INPUT_OK"),
+        "child rejected encoded input: {:?}",
+        String::from_utf8_lossy(&raw)
+    );
+    ensure!(pty.wait()?.success(), "input-check child failed");
     Ok(())
 }
 

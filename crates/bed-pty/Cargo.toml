@@ -14,4 +14,5 @@ description = "Native PTY and ConPTY process boundary for bed"
 anyhow.workspace = true
 
 [dev-dependencies]
+bed-terminal.workspace = true
 bed-vt100.workspace = true

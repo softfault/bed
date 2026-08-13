@@ -12,3 +12,4 @@ description = "Native terminal input, output, and mode handling for bed"
 
 [dependencies]
 anyhow.workspace = true
+bed-vt100.workspace = true

@@ -21,7 +21,8 @@ cursor-shape restoration, and restoration during panic unwinding.
 Linux also runs `bed-pty` against a real child pseudoterminal. Those tests cover
 I/O, resize, terminal environment selection, exit status, explicit process-group
 termination, Drop cleanup, and routing a `bed-vt100` device-status response
-back to the child.
+back to the child. It also routes application-cursor navigation and bracketed
+paste encoded by `bed-terminal` into a raw child session.
 
 ## Cross-Target Checks
 

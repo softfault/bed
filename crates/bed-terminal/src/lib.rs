@@ -9,6 +9,10 @@
 
 use anyhow::Result;
 
+mod child;
+
+pub use child::encode_child_key;
+
 #[cfg(all(
     any(
         target_os = "linux",

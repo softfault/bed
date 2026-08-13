@@ -11,7 +11,7 @@ The workspace is split into seven packages:
 | `bed-core` | Buffers, view-local cursor state, editing operations, and undo/redo | `bed-file` |
 | `bed-file` | Recoverable file replacement and its narrow native boundary | None |
 | `bed-pty` | Native PTY/ConPTY spawning, I/O, resize, status, and teardown | None |
-| `bed-terminal` | Semantic input types and native terminal backends | None |
+| `bed-terminal` | Semantic input, child-key encoding, and native terminal backends | `bed-vt100` |
 | `bed-tui` | Modes, commands, layout, and frame rendering | `bed-core`, `bed-terminal` |
 | `bed-vt100` | Incremental VT parsing, screen state, modes, and scrollback | None |
 | `bed` | Argument parsing and the main event loop | Application libraries above |
@@ -72,6 +72,11 @@ The file tree is also owned by `bed-tui`. Its root, expanded paths, selection, a
 - `crates/bed-terminal/src/terminal/vt.rs` decodes UTF-8 and VT input sequences for byte-stream terminals. It is not compiled into the Windows build.
 
 `Key::Char(char)` is the platform boundary for typed text. VT backends also deliver bracketed paste as one `Key::Paste(String)` event, while the Windows console continues to provide structured character events. Native UTF-8 or UTF-16 fragments never enter the editing core.
+
+`bed-terminal::encode_child_key` performs the opposite boundary conversion for
+embedded sessions. It encodes semantic keys using the child's application
+cursor and bracketed-paste modes reported by `bed-vt100`; it does not inspect
+editor or window modes.
 
 The TUI uses a block cursor for Normal, Visual, command, search, and tree
 modes, and a bar cursor for Insert mode. Every terminal backend restores the

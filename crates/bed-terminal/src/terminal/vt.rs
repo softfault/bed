@@ -46,6 +46,7 @@ impl<R: Read> VtInput<R> {
             b'\t' => Key::Tab,
             8 | 127 => Key::Backspace,
             1..=26 => Key::Ctrl(char::from(byte + b'a' - 1)),
+            0x1c..=0x1f => Key::Ctrl(char::from(byte + b'@')),
             b'\x1b' => self.read_escape_sequence()?,
             32..=126 => Key::Char(char::from(byte)),
             128..=255 => self.read_utf8_character(byte)?,
@@ -290,6 +291,16 @@ mod tests {
         assert_eq!(input.read_key().unwrap(), Some(Key::BackTab));
         assert_eq!(input.read_key().unwrap(), Some(Key::Enter));
         assert_eq!(input.read_key().unwrap(), None);
+    }
+
+    #[test]
+    fn decodes_terminal_mode_control_prefixes() {
+        let mut input = VtInput::new(Cursor::new(b"\x1c\x1d\x1e\x1f"));
+
+        assert_eq!(input.read_key().unwrap(), Some(Key::Ctrl('\\')));
+        assert_eq!(input.read_key().unwrap(), Some(Key::Ctrl(']')));
+        assert_eq!(input.read_key().unwrap(), Some(Key::Ctrl('^')));
+        assert_eq!(input.read_key().unwrap(), Some(Key::Ctrl('_')));
     }
 
     #[test]

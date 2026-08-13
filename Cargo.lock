@@ -49,6 +49,7 @@ name = "bed-pty"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "bed-terminal",
  "bed-vt100",
 ]
 
@@ -57,6 +58,7 @@ name = "bed-terminal"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "bed-vt100",
 ]
 
 [[package]]

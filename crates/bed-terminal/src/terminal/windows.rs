@@ -386,6 +386,10 @@ fn translate_key(event: KeyEventRecord, high_surrogate: &mut Option<u16>) -> Opt
         *high_surrogate = None;
         return Some(Key::Ctrl(char::from_u32(u32::from(unit) + 0x60)?));
     }
+    if modifiers.control && (0x1c..=0x1f).contains(&unit) {
+        *high_surrogate = None;
+        return Some(Key::Ctrl(char::from_u32(u32::from(unit) + 0x40)?));
+    }
     if (0xd800..=0xdbff).contains(&unit) {
         // KEY_EVENT_RECORD carries one UTF-16 unit, so supplementary Unicode
         // characters arrive as two records and must be joined here.
@@ -461,6 +465,10 @@ mod tests {
         assert_eq!(
             translate_key(event(0, 18, LEFT_CTRL_PRESSED), &mut surrogate),
             Some(Key::Ctrl('r'))
+        );
+        assert_eq!(
+            translate_key(event(0, 0x1c, LEFT_CTRL_PRESSED), &mut surrogate),
+            Some(Key::Ctrl('\\'))
         );
     }
 
