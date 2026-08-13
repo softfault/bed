@@ -2842,6 +2842,26 @@ mod tests {
     }
 
     #[test]
+    fn visual_put_with_an_empty_register_keeps_the_selection() {
+        let mut app = app_with(b"one two");
+        app.handle_key(Key::Char('v')).unwrap();
+        app.handle_key(Key::Char('e')).unwrap();
+        let selection = app
+            .editor()
+            .selection_range(SelectionKind::Character)
+            .unwrap();
+
+        app.handle_key(Key::Char('p')).unwrap();
+
+        assert_eq!(app.mode(), Mode::Visual);
+        assert_eq!(
+            app.editor().selection_range(SelectionKind::Character),
+            Some(selection)
+        );
+        assert_eq!(app.editor().document().as_bytes(), b"one two");
+    }
+
+    #[test]
     fn visual_substitute_targets_selected_lines_without_vim_markers() {
         let mut app = app_with(b"x=1\nx=2\nx=3");
         app.handle_key(Key::Char('V')).unwrap();
@@ -2855,6 +2875,21 @@ mod tests {
         app.handle_key(Key::Enter).unwrap();
 
         assert_eq!(app.editor().document().as_bytes(), b"xx=1\nxx=2\nx=3");
+        assert_eq!(app.editor().view().selection_anchor(), None);
+    }
+
+    #[test]
+    fn explicit_whole_buffer_substitute_ignores_the_visual_range() {
+        let mut app = app_with(b"x=1\nx=2\nx=3");
+        app.handle_key(Key::Char('V')).unwrap();
+        app.handle_key(Key::Char('j')).unwrap();
+        app.handle_key(Key::Char(':')).unwrap();
+        for character in "%s/x/y/".chars() {
+            app.handle_key(Key::Char(character)).unwrap();
+        }
+        app.handle_key(Key::Enter).unwrap();
+
+        assert_eq!(app.editor().document().as_bytes(), b"y=1\ny=2\ny=3");
         assert_eq!(app.editor().view().selection_anchor(), None);
     }
 
