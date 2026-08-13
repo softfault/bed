@@ -137,6 +137,14 @@ impl TerminalSession {
         self.size
     }
 
+    pub fn scrollback_len(&self) -> usize {
+        self.terminal.primary_screen().scrollback().len()
+    }
+
+    pub fn history_rows_pushed(&self) -> u64 {
+        self.terminal.primary_screen().history_rows_pushed()
+    }
+
     pub fn poll(&mut self) -> Result<PollResult> {
         let mut result = PollResult::default();
         while result.output_events < OUTPUT_EVENTS_PER_POLL {

@@ -172,6 +172,7 @@ pub struct Screen {
     rows: Vec<Row>,
     scrollback: VecDeque<Row>,
     scrollback_capacity: usize,
+    history_rows_pushed: u64,
     cursor: Cursor,
     saved_cursor: Cursor,
     attributes: Attributes,
@@ -195,6 +196,7 @@ impl Screen {
             rows: vec![Row::blank(columns, Attributes::default()); rows],
             scrollback: VecDeque::new(),
             scrollback_capacity,
+            history_rows_pushed: 0,
             cursor: Cursor {
                 visible: true,
                 ..Cursor::default()
@@ -234,6 +236,14 @@ impl Screen {
 
     pub fn scrollback(&self) -> &VecDeque<Row> {
         &self.scrollback
+    }
+
+    /// Returns the cumulative number of rows added to this screen's history.
+    ///
+    /// Unlike `scrollback().len()`, this advances after the bounded history is
+    /// full, allowing a view to remain anchored while new output arrives.
+    pub fn history_rows_pushed(&self) -> u64 {
+        self.history_rows_pushed
     }
 
     pub fn contents(&self) -> String {
@@ -670,6 +680,7 @@ impl Screen {
         if self.scrollback_capacity == 0 {
             return;
         }
+        self.history_rows_pushed = self.history_rows_pushed.saturating_add(1);
         self.scrollback.push_back(row);
         while self.scrollback.len() > self.scrollback_capacity {
             self.scrollback.pop_front();

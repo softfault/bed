@@ -696,6 +696,7 @@ mod tests {
         let mut terminal = TerminalEmulator::new(2, 8, 2);
         terminal.process(b"one\r\ntwo\r\nthree\r\nfour");
         assert_eq!(terminal.primary_screen().scrollback().len(), 2);
+        assert_eq!(terminal.primary_screen().history_rows_pushed(), 2);
         assert_eq!(terminal.primary_screen().scrollback()[0].text(), "one");
 
         terminal.process(b"\x1b[?1049halt\r\nscreen\r\nmore");
@@ -705,7 +706,12 @@ mod tests {
 
         assert!(!terminal.alternate_screen_active());
         assert_eq!(terminal.primary_screen().scrollback().len(), 2);
+        assert_eq!(terminal.primary_screen().history_rows_pushed(), 2);
         assert!(terminal.primary_screen().contents().contains("four"));
+
+        terminal.process(b"\r\nfive");
+        assert_eq!(terminal.primary_screen().scrollback().len(), 2);
+        assert_eq!(terminal.primary_screen().history_rows_pushed(), 3);
     }
 
     #[test]

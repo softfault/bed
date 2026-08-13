@@ -4,6 +4,13 @@ All notable changes to bed are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Independently maintained `bed-vt100`, native PTY/ConPTY process backends,
+  bounded terminal sessions, and embedded terminal splits.
+- Terminal Input and Terminal Normal modes with explicit child-input escape,
+  window commands, and view-local scrollback navigation.
+
 ## [0.3.0] - 2026-08-13
 
 ### Added

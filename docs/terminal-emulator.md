@@ -25,6 +25,29 @@ PTY spawning, process status, event delivery, copy selection, and split layout
 remain separate layers. The public API is shaped by bed's consumers rather
 than by an existing terminal crate.
 
+## TUI interaction
+
+`:terminal [COMMAND]` opens a new session in a bottom split and starts in
+Terminal Input mode. Keys are encoded from bed's semantic input events using
+the child terminal modes tracked by `bed-vt100`.
+
+Terminal Input reserves a bed-owned `Ctrl-\` prefix:
+
+- `Ctrl-\ Ctrl-N` enters Terminal Normal.
+- `Ctrl-\ Ctrl-W` applies one bed window command without sending it to the child.
+- `Ctrl-\ Ctrl-\` sends a literal `Ctrl-\` to the child.
+
+Other prefixed keys are rejected instead of being forwarded ambiguously.
+Terminal Normal uses `j`, `k`, arrows, page keys, `Ctrl-U`, and `Ctrl-D` for
+view-local scrollback, while `G` or End returns to live output. `i`, `a`, and
+Enter return to Terminal Input and live output. `:` opens bed's command mode
+and `Ctrl-W` applies a window command. These are bed semantics rather than a
+Vim compatibility contract.
+
+Several views may refer to one running session, but only the focused view owns
+its PTY dimensions. A view scrolled into history remains anchored as output
+arrives, including after the bounded history reaches capacity.
+
 ## Compatibility scope
 
 The first implementation covers sequences emitted by common shells and

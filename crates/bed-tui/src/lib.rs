@@ -55,7 +55,8 @@ pub enum Mode {
     Command,
     Search,
     Tree,
-    Terminal,
+    TerminalInput,
+    TerminalNormal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -203,6 +204,8 @@ pub struct App {
     pending: Option<Pending>,
     count: Option<usize>,
     register: Option<Register>,
+    terminal_prefix: bool,
+    command_return_mode: Mode,
     windows: HashMap<WindowId, Window>,
     layout: Layout,
     active_window: WindowId,
@@ -251,6 +254,8 @@ impl App {
             pending: None,
             count: None,
             register: None,
+            terminal_prefix: false,
+            command_return_mode: Mode::Normal,
             windows,
             layout: Layout::Window(active_window),
             active_window,
@@ -293,7 +298,8 @@ impl App {
             Mode::Command => self.handle_command_key(key)?,
             Mode::Search => self.handle_search_key(key),
             Mode::Tree => self.handle_tree_key(key),
-            Mode::Terminal => self.handle_terminal_key(key),
+            Mode::TerminalInput => self.handle_terminal_input_key(key),
+            Mode::TerminalNormal => self.handle_terminal_normal_key(key),
         }
         Ok(())
     }
@@ -303,7 +309,7 @@ impl App {
         let rows = size.rows.max(3);
         let columns = size.columns.max(1);
         if self.mode == Mode::Tree && visible_file_tree_width(columns, self.file_tree_width) == 0 {
-            self.mode = Mode::Normal;
+            self.set_mode_for_active_window();
             self.message
                 .push_str("File tree hidden: terminal is too narrow");
         }
@@ -340,7 +346,9 @@ impl App {
                     }
                 }
                 WindowContent::Terminal(terminal_view) => {
-                    self.resize_terminal_view(terminal_view, area);
+                    if window_id == active_window {
+                        self.resize_terminal_view(terminal_view, area);
+                    }
                     self.render_terminal_window(&mut output, terminal_view, area);
                     if window_id == active_window {
                         editor_cursor = self.terminal_cursor(terminal_view, area);
@@ -359,7 +367,8 @@ impl App {
             | Mode::Visual
             | Mode::VisualLine
             | Mode::Tree
-            | Mode::Terminal => self.message.clone(),
+            | Mode::TerminalInput
+            | Mode::TerminalNormal => self.message.clone(),
         };
         let prompt_width = display_width(&prompt);
         // Reserve the last cell for the command cursor and horizontally scroll
@@ -375,16 +384,19 @@ impl App {
         let (cursor_row, cursor_column) = match self.mode {
             Mode::Command | Mode::Search => (rows, prompt_width.saturating_sub(prompt_offset) + 1),
             Mode::Tree => tree_cursor,
-            Mode::Normal | Mode::Insert | Mode::Visual | Mode::VisualLine | Mode::Terminal => {
-                editor_cursor
-            }
+            Mode::Normal
+            | Mode::Insert
+            | Mode::Visual
+            | Mode::VisualLine
+            | Mode::TerminalInput
+            | Mode::TerminalNormal => editor_cursor,
         };
         move_to(
             &mut output,
             cursor_row.min(rows),
             cursor_column.min(columns),
         );
-        output.extend_from_slice(if self.mode == Mode::Insert {
+        output.extend_from_slice(if matches!(self.mode, Mode::Insert | Mode::TerminalInput) {
             BAR_CURSOR
         } else {
             BLOCK_CURSOR
@@ -619,27 +631,157 @@ impl App {
     }
 
     pub fn poll_terminals(&mut self) -> Result<bool> {
+        let previous_history: HashMap<_, _> = self
+            .terminals
+            .ids()
+            .filter_map(|id| {
+                self.terminals
+                    .get(id)
+                    .map(|session| (id, session.history_rows_pushed()))
+            })
+            .collect();
         let activity = self.terminals.poll()?;
+        for view in self
+            .terminal_views
+            .values_mut()
+            .filter(|view| view.scrollback > 0)
+        {
+            let before = previous_history.get(&view.session_id).copied().unwrap_or(0);
+            let (after, maximum) = self
+                .terminals
+                .get(view.session_id)
+                .map_or((before, 0), |session| {
+                    (session.history_rows_pushed(), session.scrollback_len())
+                });
+            view.scrollback = anchored_terminal_scrollback(view.scrollback, before, after, maximum);
+        }
         for (id, _) in &activity {
             if let Some(error) = self.terminals.get(*id).and_then(|session| session.error()) {
                 self.message
                     .push_str(&format!("Terminal {} failed: {error}", id.get()));
             }
         }
+        if self.mode == Mode::TerminalInput
+            && self
+                .active_terminal_session_id()
+                .and_then(|id| self.terminals.get(id))
+                .is_some_and(|session| session.status().is_some())
+        {
+            self.mode = Mode::TerminalNormal;
+            self.terminal_prefix = false;
+        }
         Ok(!activity.is_empty())
     }
 
-    fn handle_terminal_key(&mut self, key: Key) {
+    fn active_terminal_view_id(&self) -> Option<TerminalViewId> {
+        match self.active_window().content {
+            WindowContent::Terminal(view_id) => Some(view_id),
+            WindowContent::Text => None,
+        }
+    }
+
+    fn active_terminal_session_id(&self) -> Option<TerminalSessionId> {
+        self.active_terminal_view_id()
+            .and_then(|view_id| self.terminal_views.get(&view_id))
+            .map(|view| view.session_id)
+    }
+
+    fn send_active_terminal_key(&mut self, key: &Key) {
+        let result = self
+            .active_terminal_session_id()
+            .context("active window is not a terminal")
+            .and_then(|session_id| {
+                self.terminals
+                    .get(session_id)
+                    .context("active terminal session no longer exists")?
+                    .send_key(key)
+            });
+        if let Err(error) = result {
+            self.message
+                .push_str(&format!("Terminal input failed: {error:#}"));
+        }
+    }
+
+    fn set_active_terminal_scrollback(&mut self, rows: usize) {
+        let Some(view_id) = self.active_terminal_view_id() else {
+            return;
+        };
+        let maximum = self
+            .terminal_views
+            .get(&view_id)
+            .and_then(|view| self.terminals.get(view.session_id))
+            .map_or(0, |session| session.screen().scrollback().len());
+        if let Some(view) = self.terminal_views.get_mut(&view_id) {
+            view.scrollback = rows.min(maximum);
+        }
+    }
+
+    fn scroll_active_terminal(&mut self, up: bool, rows: usize) {
+        let current = self
+            .active_terminal_view_id()
+            .and_then(|view_id| self.terminal_views.get(&view_id))
+            .map_or(0, |view| view.scrollback);
+        self.set_active_terminal_scrollback(if up {
+            current.saturating_add(rows)
+        } else {
+            current.saturating_sub(rows)
+        });
+    }
+
+    fn active_terminal_page_rows(&self) -> usize {
+        self.layout
+            .rectangles(self.editor_area())
+            .into_iter()
+            .find(|(window_id, _)| *window_id == self.active_window)
+            .map_or(1, |(_, area)| area.rows.saturating_sub(1).max(1))
+    }
+
+    fn handle_terminal_input_key(&mut self, key: Key) {
+        if self.pending.take() == Some(Pending::Window) {
+            self.execute_window_key(&key, None, false);
+            return;
+        }
+        if self.terminal_prefix {
+            self.terminal_prefix = false;
+            match key {
+                Key::Ctrl('n') => self.mode = Mode::TerminalNormal,
+                Key::Ctrl('w') => self.pending = Some(Pending::Window),
+                Key::Ctrl('\\') => self.send_active_terminal_key(&Key::Ctrl('\\')),
+                _ => self.message.push_str("Invalid terminal prefix"),
+            }
+            return;
+        }
+        match key {
+            Key::Ctrl('\\') => self.terminal_prefix = true,
+            key => self.send_active_terminal_key(&key),
+        }
+    }
+
+    fn handle_terminal_normal_key(&mut self, key: Key) {
+        if self.pending.take() == Some(Pending::Window) {
+            self.execute_window_key(&key, None, false);
+            return;
+        }
         match key {
             Key::Char(':') => self.enter_command_mode(None),
             Key::Ctrl('w') => self.pending = Some(Pending::Window),
-            Key::Escape => self.pending = None,
-            key if self.pending.take() == Some(Pending::Window) => {
-                self.execute_window_key(&key, None, false);
+            Key::Char('i') | Key::Char('a') | Key::Enter => {
+                self.set_active_terminal_scrollback(0);
+                self.mode = Mode::TerminalInput;
             }
-            _ => self
-                .message
-                .push_str("Terminal input is not enabled in this build stage"),
+            Key::Char('j') | Key::ArrowDown => self.scroll_active_terminal(false, 1),
+            Key::Char('k') | Key::ArrowUp => self.scroll_active_terminal(true, 1),
+            Key::PageUp => self.scroll_active_terminal(true, self.active_terminal_page_rows()),
+            Key::PageDown => self.scroll_active_terminal(false, self.active_terminal_page_rows()),
+            Key::Ctrl('u') => {
+                self.scroll_active_terminal(true, (self.active_terminal_page_rows() / 2).max(1));
+            }
+            Key::Ctrl('d') => {
+                self.scroll_active_terminal(false, (self.active_terminal_page_rows() / 2).max(1));
+            }
+            Key::Char('G') | Key::End => self.set_active_terminal_scrollback(0),
+            Key::Escape => {}
+            _ => self.message.push_str("Invalid Terminal Normal command"),
         }
     }
 
@@ -1022,24 +1164,21 @@ impl App {
         match key {
             Key::Escape | Key::Ctrl('c') => {
                 self.cancel_command_selection();
-                self.set_mode_for_active_window();
+                self.mode = self.command_return_mode;
                 self.command.clear();
             }
             Key::Backspace => {
                 if self.command.pop().is_none() {
                     self.cancel_command_selection();
-                    self.set_mode_for_active_window();
+                    self.mode = self.command_return_mode;
                 }
             }
             Key::Enter => {
                 let command = std::mem::take(&mut self.command);
-                self.mode = Mode::Normal;
+                self.mode = self.command_return_mode;
                 self.execute_command(command.trim());
                 self.editor.clear_selection();
                 self.command_selection = None;
-                if self.mode == Mode::Normal {
-                    self.set_mode_for_active_window();
-                }
             }
             Key::Char(character) if !character.is_control() => self.command.push(character),
             _ => {}
@@ -1512,7 +1651,7 @@ impl App {
         window.content = WindowContent::Terminal(view_id);
         self.windows.insert(window_id, window);
         self.activate_window(window_id);
-        self.mode = Mode::Terminal;
+        self.mode = Mode::TerminalInput;
     }
 
     fn resize_terminal_view(&mut self, view_id: TerminalViewId, area: Rect) {
@@ -1706,7 +1845,7 @@ impl App {
             if matches!(key, Key::Char('w') | Key::Ctrl('w'))
                 || window_direction(key) == Some(Direction::Right)
             {
-                self.mode = Mode::Normal;
+                self.set_mode_for_active_window();
                 return;
             }
             if window_direction(key).is_some() {
@@ -1847,10 +1986,7 @@ impl App {
             .retain(|&candidate| candidate != self.active_window);
         self.active_window_history.push(self.active_window);
         self.active_window = window_id;
-        self.mode = match self.active_window().content {
-            WindowContent::Text => Mode::Normal,
-            WindowContent::Terminal(_) => Mode::Terminal,
-        };
+        self.set_mode_for_active_window();
     }
 
     fn editor_area(&self) -> Rect {
@@ -2198,9 +2334,11 @@ impl App {
     }
 
     fn set_mode_for_active_window(&mut self) {
+        self.pending = None;
+        self.terminal_prefix = false;
         self.mode = match self.active_window().content {
             WindowContent::Text => Mode::Normal,
-            WindowContent::Terminal(_) => Mode::Terminal,
+            WindowContent::Terminal(_) => Mode::TerminalNormal,
         };
     }
 
@@ -2477,6 +2615,10 @@ impl App {
     }
 
     fn enter_command_mode(&mut self, selection: Option<SelectionKind>) {
+        self.command_return_mode = match self.mode {
+            Mode::TerminalInput | Mode::TerminalNormal => self.mode,
+            _ => Mode::Normal,
+        };
         self.mode = Mode::Command;
         self.command.clear();
         self.command_selection = selection;
@@ -2594,7 +2736,8 @@ impl App {
             (true, Mode::Command) => "COMMAND",
             (true, Mode::Search) => "SEARCH",
             (true, Mode::Tree) => "TREE",
-            (true, Mode::Terminal) => "TERMINAL",
+            (true, Mode::TerminalInput) => "TERMINAL INPUT",
+            (true, Mode::TerminalNormal) => "TERMINAL NORMAL",
             (false, _) => "",
         };
         let dirty = if self.editor.document().is_dirty() {
@@ -3032,6 +3175,17 @@ fn render_terminal_row(output: &mut Vec<u8>, row: &Row, columns: usize) {
     output.extend_from_slice(RESET_STYLE);
 }
 
+fn anchored_terminal_scrollback(
+    current: usize,
+    history_before: u64,
+    history_after: u64,
+    maximum: usize,
+) -> usize {
+    let advanced =
+        usize::try_from(history_after.saturating_sub(history_before)).unwrap_or(usize::MAX);
+    current.saturating_add(advanced).min(maximum)
+}
+
 fn sgr_attributes(attributes: Attributes) -> String {
     let mut parameters = Vec::new();
     if attributes.bold {
@@ -3088,8 +3242,9 @@ fn push_sgr_color(parameters: &mut Vec<String>, color: Color, foreground: bool) 
 #[cfg(test)]
 mod tests {
     use super::{
-        App, Command, DEFAULT_FILE_TREE_WIDTH, Mode, ParsedSubstitute, SplitAxis, display_width,
-        parse_command, parse_substitute_expression, render_text_with_selection, sgr_attributes,
+        App, Command, DEFAULT_FILE_TREE_WIDTH, Mode, ParsedSubstitute, SplitAxis,
+        anchored_terminal_scrollback, display_width, parse_command, parse_substitute_expression,
+        render_text_with_selection, sgr_attributes,
     };
     use bed_core::{Document, Editor, SelectionKind, SubstituteOptions, SubstituteRange};
     use bed_terminal::{Key, TerminalSize};
@@ -3163,7 +3318,7 @@ mod tests {
 
         execute(&mut app, "terminal printf '\\033[31mREADY\\033[0m'");
 
-        assert_eq!(app.mode(), Mode::Terminal);
+        assert_eq!(app.mode(), Mode::TerminalInput);
         assert_eq!(app.layout.windows().len(), 2);
         let view_id = match app.active_window().content {
             super::WindowContent::Terminal(view_id) => view_id,
@@ -3171,9 +3326,16 @@ mod tests {
         };
         let session_id = app.terminal_views[&view_id].session_id;
         let deadline = Instant::now() + Duration::from_secs(5);
-        while app.terminals.get(session_id).unwrap().status().is_none() {
+        while app.terminals.get(session_id).is_some_and(|session| {
+            session.status().is_none()
+                || !session.reached_eof()
+                || !session.screen().contents().contains("READY")
+        }) {
             app.poll_terminals().unwrap();
-            assert!(Instant::now() < deadline, "terminal command did not exit");
+            assert!(
+                Instant::now() < deadline,
+                "terminal command output did not finish"
+            );
             thread::sleep(Duration::from_millis(2));
         }
 
@@ -3196,6 +3358,8 @@ mod tests {
     fn normal_quit_protects_a_running_terminal_session() {
         let mut app = app_with(b"");
         execute(&mut app, "terminal sleep 30");
+        app.handle_key(Key::Ctrl('\\')).unwrap();
+        app.handle_key(Key::Ctrl('n')).unwrap();
 
         execute(&mut app, "q");
 
@@ -3203,6 +3367,124 @@ mod tests {
         assert!(app.message.contains("terminal session(s) still running"));
         execute(&mut app, "q!");
         assert!(app.should_quit());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_input_and_normal_modes_route_keys_deliberately() {
+        use std::{
+            thread,
+            time::{Duration, Instant},
+        };
+
+        let mut app = app_with(b"");
+        execute(
+            &mut app,
+            "terminal stty raw -echo; printf 'INPUT_READY\\r\\n'; bytes=$(dd bs=1 count=7 2>/dev/null | od -An -tx1 | tr -d ' \\n'); [ \"$bytes\" = 68656c6c6f0d1c ] && printf '\\r\\nINPUT_OK\\r\\n'",
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app
+            .active_terminal_session_id()
+            .and_then(|id| app.terminals.get(id))
+            .is_some_and(|session| !session.screen().contents().contains("INPUT_READY"))
+        {
+            app.poll_terminals().unwrap();
+            assert!(
+                Instant::now() < deadline,
+                "terminal child did not become ready"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        for key in [
+            Key::Char('h'),
+            Key::Char('e'),
+            Key::Char('l'),
+            Key::Char('l'),
+            Key::Char('o'),
+            Key::Enter,
+            Key::Ctrl('\\'),
+            Key::Ctrl('\\'),
+            Key::Ctrl('\\'),
+            Key::Ctrl('n'),
+        ] {
+            app.handle_key(key).unwrap();
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app
+            .active_terminal_session_id()
+            .and_then(|id| app.terminals.get(id))
+            .is_some_and(|session| session.status().is_none())
+        {
+            app.poll_terminals().unwrap();
+            assert!(
+                Instant::now() < deadline,
+                "terminal input child did not exit"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        let session_id = app.active_terminal_session_id().unwrap();
+        assert!(
+            app.terminals
+                .get(session_id)
+                .unwrap()
+                .screen()
+                .contents()
+                .contains("INPUT_OK")
+        );
+        assert_eq!(app.mode(), Mode::TerminalNormal);
+
+        app.handle_key(Key::Char('k')).unwrap();
+        app.handle_key(Key::Char('i')).unwrap();
+        assert_eq!(app.mode(), Mode::TerminalInput);
+        assert_eq!(
+            app.terminal_views[&app.active_terminal_view_id().unwrap()].scrollback,
+            0
+        );
+    }
+
+    #[test]
+    fn anchors_bounded_terminal_scrollback_as_history_advances() {
+        assert_eq!(anchored_terminal_scrollback(3, 10, 12, 10), 5);
+        assert_eq!(anchored_terminal_scrollback(9, 10, 12, 10), 10);
+        assert_eq!(anchored_terminal_scrollback(9, 12, 3, 4), 4);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_window_prefix_restores_modes_and_focused_resize_ownership() {
+        let mut app = app_with(b"");
+        app.render(TerminalSize {
+            rows: 20,
+            columns: 80,
+        });
+        execute(&mut app, "terminal sleep 30");
+        app.render(TerminalSize {
+            rows: 20,
+            columns: 80,
+        });
+        let session_id = app.active_terminal_session_id().unwrap();
+        let terminal_size = app.terminals.get(session_id).unwrap().size();
+
+        app.handle_key(Key::Ctrl('\\')).unwrap();
+        app.handle_key(Key::Ctrl('w')).unwrap();
+        app.handle_key(Key::Char('w')).unwrap();
+        assert_eq!(app.mode(), Mode::Normal);
+        assert!(!app.terminal_prefix);
+        app.render(TerminalSize {
+            rows: 30,
+            columns: 100,
+        });
+        assert_eq!(app.terminals.get(session_id).unwrap().size(), terminal_size);
+
+        app.handle_key(Key::Ctrl('w')).unwrap();
+        app.handle_key(Key::Char('w')).unwrap();
+        assert_eq!(app.mode(), Mode::TerminalNormal);
+        app.render(TerminalSize {
+            rows: 30,
+            columns: 100,
+        });
+        assert_ne!(app.terminals.get(session_id).unwrap().size(), terminal_size);
     }
 
     #[test]
