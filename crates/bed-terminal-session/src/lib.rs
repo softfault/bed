@@ -145,6 +145,14 @@ impl TerminalSession {
         self.terminal.primary_screen().history_rows_pushed()
     }
 
+    pub fn history_rows_discarded(&self) -> u64 {
+        self.terminal.primary_screen().history_rows_discarded()
+    }
+
+    pub fn reset_count(&self) -> u64 {
+        self.terminal.reset_count()
+    }
+
     pub fn poll(&mut self) -> Result<PollResult> {
         let mut result = PollResult::default();
         while result.output_events < OUTPUT_EVENTS_PER_POLL {

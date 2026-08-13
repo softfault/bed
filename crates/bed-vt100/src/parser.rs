@@ -32,6 +32,7 @@ pub struct TerminalEmulator {
     responses: Vec<u8>,
     unsupported_sequences: usize,
     bell_count: usize,
+    reset_count: u64,
     scrollback_capacity: usize,
 }
 
@@ -49,6 +50,7 @@ impl TerminalEmulator {
             responses: Vec::new(),
             unsupported_sequences: 0,
             bell_count: 0,
+            reset_count: 0,
             scrollback_capacity,
         }
     }
@@ -106,6 +108,10 @@ impl TerminalEmulator {
 
     pub fn bell_count(&self) -> usize {
         self.bell_count
+    }
+
+    pub fn reset_count(&self) -> u64 {
+        self.reset_count
     }
 
     pub fn take_responses(&mut self) -> Vec<u8> {
@@ -587,6 +593,7 @@ impl TerminalEmulator {
         self.utf8_expected = 0;
         self.title.clear();
         self.responses.clear();
+        self.reset_count = self.reset_count.saturating_add(1);
     }
 }
 
@@ -697,6 +704,7 @@ mod tests {
         terminal.process(b"one\r\ntwo\r\nthree\r\nfour");
         assert_eq!(terminal.primary_screen().scrollback().len(), 2);
         assert_eq!(terminal.primary_screen().history_rows_pushed(), 2);
+        assert_eq!(terminal.primary_screen().history_rows_discarded(), 0);
         assert_eq!(terminal.primary_screen().scrollback()[0].text(), "one");
 
         terminal.process(b"\x1b[?1049halt\r\nscreen\r\nmore");
@@ -712,6 +720,7 @@ mod tests {
         terminal.process(b"\r\nfive");
         assert_eq!(terminal.primary_screen().scrollback().len(), 2);
         assert_eq!(terminal.primary_screen().history_rows_pushed(), 3);
+        assert_eq!(terminal.primary_screen().history_rows_discarded(), 1);
     }
 
     #[test]
@@ -787,7 +796,21 @@ mod tests {
         terminal.process(b"\x1b[3J");
 
         assert!(terminal.screen().scrollback().is_empty());
+        assert_eq!(terminal.primary_screen().history_rows_discarded(), 1);
         assert_eq!(terminal.screen().contents(), visible);
+    }
+
+    #[test]
+    fn hard_reset_advances_the_screen_generation() {
+        let mut terminal = TerminalEmulator::new(2, 8, 10);
+        terminal.process(b"one\r\ntwo\r\nthree");
+        assert_eq!(terminal.reset_count(), 0);
+
+        terminal.process(b"\x1bc");
+
+        assert_eq!(terminal.reset_count(), 1);
+        assert!(terminal.primary_screen().scrollback().is_empty());
+        assert_eq!(terminal.screen().contents(), "\n");
     }
 
     #[test]

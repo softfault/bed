@@ -44,6 +44,12 @@ Enter return to Terminal Input and live output. `:` opens bed's command mode
 and `Ctrl-W` applies a window command. These are bed semantics rather than a
 Vim compatibility contract.
 
+`v` enters Terminal Visual, whose selection belongs to the view rather than the
+session. Cell motions account for wide graphemes, `y` copies into bed's shared
+register, and soft-wrapped rows are joined without an inserted newline. The
+selection remains anchored while output advances and is clamped when bounded
+history evicts its oldest rows.
+
 Several views may refer to one running session, but only the focused view owns
 its PTY dimensions. A view scrolled into history remains anchored as output
 arrives, including after the bounded history reaches capacity.

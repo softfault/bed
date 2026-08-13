@@ -173,6 +173,7 @@ pub struct Screen {
     scrollback: VecDeque<Row>,
     scrollback_capacity: usize,
     history_rows_pushed: u64,
+    history_rows_discarded: u64,
     cursor: Cursor,
     saved_cursor: Cursor,
     attributes: Attributes,
@@ -197,6 +198,7 @@ impl Screen {
             scrollback: VecDeque::new(),
             scrollback_capacity,
             history_rows_pushed: 0,
+            history_rows_discarded: 0,
             cursor: Cursor {
                 visible: true,
                 ..Cursor::default()
@@ -246,6 +248,12 @@ impl Screen {
         self.history_rows_pushed
     }
 
+    /// Returns the cumulative number of rows permanently removed from the
+    /// front of this screen's history.
+    pub fn history_rows_discarded(&self) -> u64 {
+        self.history_rows_discarded
+    }
+
     pub fn contents(&self) -> String {
         self.rows
             .iter()
@@ -273,7 +281,7 @@ impl Screen {
     pub(crate) fn clear(&mut self) {
         let (rows, columns) = self.size();
         self.rows = vec![Row::blank(columns, Attributes::default()); rows];
-        self.scrollback.clear();
+        self.discard_scrollback();
         self.cursor = Cursor {
             visible: self.cursor.visible,
             ..Cursor::default()
@@ -531,7 +539,7 @@ impl Screen {
                     self.erase_row_range(row, 0, width);
                 }
             }
-            3 => self.scrollback.clear(),
+            3 => self.discard_scrollback(),
             _ => {}
         }
     }
@@ -684,7 +692,15 @@ impl Screen {
         self.scrollback.push_back(row);
         while self.scrollback.len() > self.scrollback_capacity {
             self.scrollback.pop_front();
+            self.history_rows_discarded = self.history_rows_discarded.saturating_add(1);
         }
+    }
+
+    fn discard_scrollback(&mut self) {
+        self.history_rows_discarded = self
+            .history_rows_discarded
+            .saturating_add(u64::try_from(self.scrollback.len()).unwrap_or(u64::MAX));
+        self.scrollback.clear();
     }
 }
 

@@ -80,8 +80,15 @@ Terminal Normal mode:
 
 - `j` / `k`, arrows, page keys, `Ctrl-U`, and `Ctrl-D`: navigate view-local scrollback.
 - `G` or End: return to live output.
+- `v`: begin a cell-based Terminal Visual selection.
 - `i`, `a`, or Enter: return to Terminal Input and live output.
 - `Ctrl-W`: apply one bed window command; `:` enters command mode.
+
+Terminal Visual mode:
+
+- `h` / `j` / `k` / `l` or arrows: extend the selection by terminal cells.
+- `0` / `$` or Home / End: move to the start/end of the current terminal row.
+- `y`: copy the selection into bed's register; `Escape`, `Ctrl-C`, or `v` cancels.
 
 Terminal modes are intentionally bed-specific and do not promise Vim terminal
 compatibility.

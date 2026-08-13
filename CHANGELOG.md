@@ -11,6 +11,8 @@ All notable changes to bed are documented in this file.
 - Terminal Input and Terminal Normal modes with explicit child-input escape,
   window commands, and view-local scrollback navigation.
 - Terminal session listing, reattachment, and explicit process cleanup commands.
+- Cell-based terminal selection and register copying across scrollback, wide
+  graphemes, and soft-wrapped rows.
 
 ## [0.3.0] - 2026-08-13
 

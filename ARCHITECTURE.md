@@ -86,10 +86,11 @@ embedded sessions. It encodes semantic keys using the child's application
 cursor and bracketed-paste modes reported by `bed-vt100`; it does not inspect
 editor or window modes.
 
-The TUI uses a block cursor for Normal, Visual, command, search, tree, and
-Terminal Normal modes, and a bar cursor for Insert and Terminal Input modes.
-Every terminal backend restores the terminal-selected default cursor shape
-when bed exits, including panic unwinding on native backends that support it.
+The TUI uses a block cursor for Normal, Visual, command, search, tree, Terminal
+Normal, and Terminal Visual modes, and a bar cursor for Insert and Terminal
+Input modes. Every terminal backend restores the terminal-selected default
+cursor shape when bed exits, including panic unwinding on native backends that
+support it.
 
 ## Pseudoterminal backends
 
@@ -114,9 +115,11 @@ bed-specific `Ctrl-\` prefix accepts `Ctrl-N` to enter Terminal Normal,
 `Ctrl-W` to execute one window command, or another `Ctrl-\` to send a literal
 control character. Terminal Normal owns scrollback navigation and enters
 Terminal Input with `i`, `a`, or Enter; it deliberately does not promise Vim
-terminal-mode compatibility. Terminal-emulation state stays separate from the
-native PTY/ConPTY process boundary and UI placement. Its compatibility scope
-and release gates are defined in
+terminal-mode compatibility. Terminal Visual owns a view-local cell selection,
+preserves wide graphemes and soft wrapping when copying, and writes to bed's
+shared register. Terminal-emulation state stays separate from the native
+PTY/ConPTY process boundary and UI placement. Its compatibility scope and
+release gates are defined in
 [`docs/terminal-emulator.md`](docs/terminal-emulator.md).
 
 ## Supported targets

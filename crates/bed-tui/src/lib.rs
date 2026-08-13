@@ -20,7 +20,7 @@ use bed_core::{
 };
 use bed_terminal::{Key, SpecialKey, TerminalSize};
 use bed_terminal_session::{TerminalSessionId, TerminalStore};
-use bed_vt100::{Attributes, Color, Row};
+use bed_vt100::{Attributes, Color, Row, Screen};
 use file_tree::{FileTree, TreeEntryKind};
 use layout::{Direction, Layout, Rect, ResizeAmount, SplitAxis, WindowId, window_in_direction};
 use std::{collections::HashMap, path::PathBuf};
@@ -57,6 +57,7 @@ pub enum Mode {
     Tree,
     TerminalInput,
     TerminalNormal,
+    TerminalVisual,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,6 +159,19 @@ struct TerminalViewId(u64);
 struct TerminalView {
     session_id: TerminalSessionId,
     scrollback: usize,
+    selection: Option<TerminalSelection>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct TerminalPosition {
+    row: usize,
+    column: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TerminalSelection {
+    anchor: TerminalPosition,
+    cursor: TerminalPosition,
 }
 
 #[derive(Debug)]
@@ -306,6 +320,7 @@ impl App {
             Mode::Tree => self.handle_tree_key(key),
             Mode::TerminalInput => self.handle_terminal_input_key(key),
             Mode::TerminalNormal => self.handle_terminal_normal_key(key),
+            Mode::TerminalVisual => self.handle_terminal_visual_key(key),
         }
         Ok(())
     }
@@ -374,7 +389,8 @@ impl App {
             | Mode::VisualLine
             | Mode::Tree
             | Mode::TerminalInput
-            | Mode::TerminalNormal => self.message.clone(),
+            | Mode::TerminalNormal
+            | Mode::TerminalVisual => self.message.clone(),
         };
         let prompt_width = display_width(&prompt);
         // Reserve the last cell for the command cursor and horizontally scroll
@@ -395,7 +411,8 @@ impl App {
             | Mode::Visual
             | Mode::VisualLine
             | Mode::TerminalInput
-            | Mode::TerminalNormal => editor_cursor,
+            | Mode::TerminalNormal
+            | Mode::TerminalVisual => editor_cursor,
         };
         move_to(
             &mut output,
@@ -497,6 +514,10 @@ impl App {
         let text_rows = area.rows.saturating_sub(1);
         let history = screen.scrollback();
         let visible_start = history.len().saturating_sub(view.scrollback);
+        let selection = (self.active_terminal_view_id() == Some(view_id)
+            && self.mode == Mode::TerminalVisual)
+            .then_some(view.selection)
+            .flatten();
         let rows = history
             .iter()
             .skip(visible_start)
@@ -504,7 +525,12 @@ impl App {
             .take(text_rows);
         for (screen_row, row) in rows.enumerate() {
             move_to(output, area.row + screen_row + 1, area.column + 1);
-            render_terminal_row(output, row, area.columns);
+            render_terminal_row(
+                output,
+                row,
+                area.columns,
+                selection.map(|selection| (visible_start + screen_row, selection)),
+            );
         }
         output.extend_from_slice(RESET_STYLE);
 
@@ -539,6 +565,25 @@ impl App {
         let Some(session) = self.terminals.get(view.session_id) else {
             return (area.row + 1, area.column + 1);
         };
+        if self.mode == Mode::TerminalVisual
+            && let Some(selection) = view.selection
+        {
+            let visible_start = session
+                .screen()
+                .scrollback()
+                .len()
+                .saturating_sub(view.scrollback);
+            return (
+                area.row
+                    + selection
+                        .cursor
+                        .row
+                        .saturating_sub(visible_start)
+                        .min(area.rows.saturating_sub(2))
+                    + 1,
+                area.column + selection.cursor.column.min(area.columns.saturating_sub(1)) + 1,
+            );
+        }
         let cursor = session.screen().cursor();
         (
             area.row + cursor.row.min(area.rows.saturating_sub(2)) + 1,
@@ -641,25 +686,59 @@ impl App {
             .terminals
             .ids()
             .filter_map(|id| {
-                self.terminals
-                    .get(id)
-                    .map(|session| (id, session.history_rows_pushed()))
+                self.terminals.get(id).map(|session| {
+                    (
+                        id,
+                        (
+                            session.history_rows_pushed(),
+                            session.history_rows_discarded(),
+                            session.reset_count(),
+                        ),
+                    )
+                })
             })
             .collect();
         let activity = self.terminals.poll()?;
-        for view in self
+        let active_terminal_view = self.active_terminal_view_id();
+        let mut active_selection_cleared = false;
+        for (&view_id, view) in self
             .terminal_views
-            .values_mut()
-            .filter(|view| view.scrollback > 0)
+            .iter_mut()
+            .filter(|(_, view)| view.scrollback > 0 || view.selection.is_some())
         {
-            let before = previous_history.get(&view.session_id).copied().unwrap_or(0);
-            let (after, maximum) = self
+            let (before, discarded_before, reset_before) = previous_history
+                .get(&view.session_id)
+                .copied()
+                .unwrap_or((0, 0, 0));
+            let (after, discarded_after, reset_after, maximum) = self
                 .terminals
                 .get(view.session_id)
-                .map_or((before, 0), |session| {
-                    (session.history_rows_pushed(), session.scrollback_len())
+                .map_or((before, discarded_before, reset_before, 0), |session| {
+                    (
+                        session.history_rows_pushed(),
+                        session.history_rows_discarded(),
+                        session.reset_count(),
+                        session.scrollback_len(),
+                    )
                 });
+            if reset_after != reset_before {
+                view.scrollback = 0;
+                active_selection_cleared |=
+                    Some(view_id) == active_terminal_view && view.selection.is_some();
+                view.selection = None;
+                continue;
+            }
             view.scrollback = anchored_terminal_scrollback(view.scrollback, before, after, maximum);
+            let discarded = usize::try_from(discarded_after.saturating_sub(discarded_before))
+                .unwrap_or(usize::MAX);
+            if let Some(selection) = view.selection {
+                view.selection = shift_terminal_selection(selection, discarded);
+                active_selection_cleared |=
+                    Some(view_id) == active_terminal_view && view.selection.is_none();
+            }
+        }
+        if active_selection_cleared && self.mode == Mode::TerminalVisual {
+            self.mode = Mode::TerminalNormal;
         }
         for (id, _) in &activity {
             if let Some(error) = self.terminals.get(*id).and_then(|session| session.error()) {
@@ -786,9 +865,160 @@ impl App {
                 self.scroll_active_terminal(false, (self.active_terminal_page_rows() / 2).max(1));
             }
             Key::Char('G') | Key::End => self.set_active_terminal_scrollback(0),
+            Key::Char('v') => self.enter_terminal_visual(),
             Key::Escape => {}
             _ => self.message.push_str("Invalid Terminal Normal command"),
         }
+    }
+
+    fn enter_terminal_visual(&mut self) {
+        let Some(view_id) = self.active_terminal_view_id() else {
+            return;
+        };
+        let Some(view) = self.terminal_views.get(&view_id).copied() else {
+            return;
+        };
+        let Some(session) = self.terminals.get(view.session_id) else {
+            return;
+        };
+        let history_len = session.screen().scrollback().len();
+        let position = if view.scrollback == 0 {
+            let cursor = session.screen().cursor();
+            TerminalPosition {
+                row: history_len + cursor.row,
+                column: cursor.column,
+            }
+        } else {
+            TerminalPosition {
+                row: history_len.saturating_sub(view.scrollback),
+                column: 0,
+            }
+        };
+        let position = normalize_terminal_position(session.screen(), position);
+        self.terminal_views
+            .get_mut(&view_id)
+            .expect("active terminal view remains present")
+            .selection = Some(TerminalSelection {
+            anchor: position,
+            cursor: position,
+        });
+        self.mode = Mode::TerminalVisual;
+    }
+
+    fn handle_terminal_visual_key(&mut self, key: Key) {
+        match key {
+            Key::Escape | Key::Ctrl('c') | Key::Char('v') => self.leave_terminal_visual(),
+            Key::Char('h') | Key::ArrowLeft => self.move_terminal_selection(0, -1),
+            Key::Char('l') | Key::ArrowRight => self.move_terminal_selection(0, 1),
+            Key::Char('j') | Key::ArrowDown => self.move_terminal_selection(1, 0),
+            Key::Char('k') | Key::ArrowUp => self.move_terminal_selection(-1, 0),
+            Key::Char('0') | Key::Home => self.move_terminal_selection_to_edge(false),
+            Key::Char('$') | Key::End => self.move_terminal_selection_to_edge(true),
+            Key::Char('y') => self.yank_terminal_selection(),
+            _ => self.message.push_str("Invalid Terminal Visual command"),
+        }
+    }
+
+    fn leave_terminal_visual(&mut self) {
+        if let Some(view_id) = self.active_terminal_view_id()
+            && let Some(view) = self.terminal_views.get_mut(&view_id)
+        {
+            view.selection = None;
+        }
+        self.mode = Mode::TerminalNormal;
+    }
+
+    fn move_terminal_selection(&mut self, rows: isize, columns: isize) {
+        let Some(view_id) = self.active_terminal_view_id() else {
+            return;
+        };
+        let Some(view) = self.terminal_views.get(&view_id).copied() else {
+            return;
+        };
+        let Some(session) = self.terminals.get(view.session_id) else {
+            return;
+        };
+        let Some(mut selection) = view.selection else {
+            return;
+        };
+        selection.cursor =
+            move_terminal_position(session.screen(), selection.cursor, rows, columns);
+        self.terminal_views
+            .get_mut(&view_id)
+            .expect("active terminal view remains present")
+            .selection = Some(selection);
+        self.reveal_terminal_selection(view_id);
+    }
+
+    fn move_terminal_selection_to_edge(&mut self, end: bool) {
+        let Some(view_id) = self.active_terminal_view_id() else {
+            return;
+        };
+        let Some(view) = self.terminal_views.get(&view_id).copied() else {
+            return;
+        };
+        let Some(session) = self.terminals.get(view.session_id) else {
+            return;
+        };
+        let Some(mut selection) = view.selection else {
+            return;
+        };
+        selection.cursor.column = if end {
+            terminal_row(session.screen(), selection.cursor.row).map_or(0, last_terminal_column)
+        } else {
+            0
+        };
+        self.terminal_views
+            .get_mut(&view_id)
+            .expect("active terminal view remains present")
+            .selection = Some(selection);
+    }
+
+    fn reveal_terminal_selection(&mut self, view_id: TerminalViewId) {
+        let Some(view) = self.terminal_views.get(&view_id).copied() else {
+            return;
+        };
+        let Some(selection) = view.selection else {
+            return;
+        };
+        let history_len = self
+            .terminals
+            .get(view.session_id)
+            .map_or(0, |session| session.screen().scrollback().len());
+        let visible_start = history_len.saturating_sub(view.scrollback);
+        let page_rows = self.active_terminal_page_rows();
+        let next = if selection.cursor.row < visible_start {
+            history_len.saturating_sub(selection.cursor.row)
+        } else if selection.cursor.row >= visible_start.saturating_add(page_rows) {
+            history_len.saturating_sub(
+                selection
+                    .cursor
+                    .row
+                    .saturating_sub(page_rows.saturating_sub(1)),
+            )
+        } else {
+            view.scrollback
+        };
+        self.set_active_terminal_scrollback(next);
+    }
+
+    fn yank_terminal_selection(&mut self) {
+        let Some(view_id) = self.active_terminal_view_id() else {
+            return;
+        };
+        let Some(view) = self.terminal_views.get(&view_id).copied() else {
+            return;
+        };
+        let Some(selection) = view.selection else {
+            return;
+        };
+        let Some(session) = self.terminals.get(view.session_id) else {
+            return;
+        };
+        let bytes = terminal_selection_text(session.screen(), selection).into_bytes();
+        self.register = Some(Register::Character(bytes));
+        self.leave_terminal_visual();
+        self.message.push_str("Terminal text yanked");
     }
 
     fn handle_normal_key(&mut self, key: Key) -> Result<()> {
@@ -1651,6 +1881,7 @@ impl App {
             TerminalView {
                 session_id,
                 scrollback: 0,
+                selection: None,
             },
         );
 
@@ -1733,6 +1964,7 @@ impl App {
             TerminalView {
                 session_id,
                 scrollback: 0,
+                selection: None,
             },
         );
         self.open_terminal_view(view_id, false);
@@ -2727,7 +2959,7 @@ impl App {
 
     fn enter_command_mode(&mut self, selection: Option<SelectionKind>) {
         self.command_return_mode = match self.mode {
-            Mode::TerminalInput | Mode::TerminalNormal => self.mode,
+            Mode::TerminalInput | Mode::TerminalNormal | Mode::TerminalVisual => self.mode,
             _ => Mode::Normal,
         };
         self.mode = Mode::Command;
@@ -2849,6 +3081,7 @@ impl App {
             (true, Mode::Tree) => "TREE",
             (true, Mode::TerminalInput) => "TERMINAL INPUT",
             (true, Mode::TerminalNormal) => "TERMINAL NORMAL",
+            (true, Mode::TerminalVisual) => "TERMINAL VISUAL",
             (false, _) => "",
         };
         let dirty = if self.editor.document().is_dirty() {
@@ -3267,10 +3500,15 @@ fn render_line_number(row: usize, exists: bool, width: usize) -> String {
     }
 }
 
-fn render_terminal_row(output: &mut Vec<u8>, row: &Row, columns: usize) {
+fn render_terminal_row(
+    output: &mut Vec<u8>,
+    row: &Row,
+    columns: usize,
+    selection: Option<(usize, TerminalSelection)>,
+) {
     let mut used = 0;
     let mut attributes = None;
-    for cell in row.cells() {
+    for (column, cell) in row.cells().iter().enumerate() {
         if cell.is_continuation() || used >= columns {
             continue;
         }
@@ -3278,7 +3516,12 @@ fn render_terminal_row(output: &mut Vec<u8>, row: &Row, columns: usize) {
         if used + width > columns {
             break;
         }
-        let next = cell.attributes();
+        let selected = selection
+            .is_some_and(|(row, selection)| terminal_cell_selected(row, column, width, selection));
+        let mut next = cell.attributes();
+        if selected {
+            next.inverse = !next.inverse;
+        }
         if attributes != Some(next) {
             output.extend_from_slice(RESET_STYLE);
             output.extend_from_slice(sgr_attributes(next).as_bytes());
@@ -3288,6 +3531,147 @@ fn render_terminal_row(output: &mut Vec<u8>, row: &Row, columns: usize) {
         used += width;
     }
     output.extend_from_slice(RESET_STYLE);
+}
+
+fn terminal_row(screen: &Screen, row: usize) -> Option<&Row> {
+    let history_len = screen.scrollback().len();
+    if row < history_len {
+        screen.scrollback().get(row)
+    } else {
+        screen.rows().get(row - history_len)
+    }
+}
+
+fn last_terminal_column(row: &Row) -> usize {
+    row.cells()
+        .iter()
+        .rposition(|cell| !cell.is_continuation() && cell.contents() != " ")
+        .unwrap_or(0)
+}
+
+fn normalize_terminal_position(
+    screen: &Screen,
+    mut position: TerminalPosition,
+) -> TerminalPosition {
+    let row_count = screen
+        .scrollback()
+        .len()
+        .saturating_add(screen.rows().len());
+    position.row = position.row.min(row_count.saturating_sub(1));
+    let Some(row) = terminal_row(screen, position.row) else {
+        return TerminalPosition::default();
+    };
+    position.column = position.column.min(row.cells().len().saturating_sub(1));
+    while position.column > 0 && row.cells()[position.column].is_continuation() {
+        position.column -= 1;
+    }
+    position
+}
+
+fn move_terminal_position(
+    screen: &Screen,
+    position: TerminalPosition,
+    rows: isize,
+    columns: isize,
+) -> TerminalPosition {
+    let row_count = screen
+        .scrollback()
+        .len()
+        .saturating_add(screen.rows().len());
+    let row = position
+        .row
+        .saturating_add_signed(rows)
+        .min(row_count.saturating_sub(1));
+    let Some(target) = terminal_row(screen, row) else {
+        return position;
+    };
+    let mut column = position
+        .column
+        .saturating_add_signed(columns)
+        .min(target.cells().len().saturating_sub(1));
+    if columns > 0 {
+        while column + 1 < target.cells().len() && target.cells()[column].is_continuation() {
+            column += 1;
+        }
+    } else {
+        while column > 0 && target.cells()[column].is_continuation() {
+            column -= 1;
+        }
+    }
+    TerminalPosition { row, column }
+}
+
+fn terminal_selection_bounds(selection: TerminalSelection) -> (TerminalPosition, TerminalPosition) {
+    if selection.anchor <= selection.cursor {
+        (selection.anchor, selection.cursor)
+    } else {
+        (selection.cursor, selection.anchor)
+    }
+}
+
+fn shift_terminal_selection(
+    mut selection: TerminalSelection,
+    discarded_rows: usize,
+) -> Option<TerminalSelection> {
+    if selection.anchor.row < discarded_rows && selection.cursor.row < discarded_rows {
+        return None;
+    }
+    selection.anchor.row = selection.anchor.row.saturating_sub(discarded_rows);
+    selection.cursor.row = selection.cursor.row.saturating_sub(discarded_rows);
+    Some(selection)
+}
+
+fn terminal_cell_selected(
+    row: usize,
+    column: usize,
+    width: usize,
+    selection: TerminalSelection,
+) -> bool {
+    let (start, end) = terminal_selection_bounds(selection);
+    let cell_end = column.saturating_add(width.saturating_sub(1));
+    (row > start.row || cell_end >= start.column)
+        && (row < end.row || column <= end.column)
+        && (start.row..=end.row).contains(&row)
+}
+
+fn terminal_selection_text(screen: &Screen, selection: TerminalSelection) -> String {
+    let (start, end) = terminal_selection_bounds(selection);
+    let mut output = String::new();
+    for row_index in start.row..=end.row {
+        let Some(row) = terminal_row(screen, row_index) else {
+            break;
+        };
+        let start_column = if row_index == start.row {
+            start.column
+        } else {
+            0
+        };
+        let end_column = if row_index == end.row {
+            end.column
+        } else {
+            row.cells().len().saturating_sub(1)
+        };
+        let mut line = String::new();
+        for (column, cell) in row.cells().iter().enumerate() {
+            if cell.is_continuation() {
+                continue;
+            }
+            let width = UnicodeWidthStr::width(cell.contents()).max(1);
+            let cell_end = column.saturating_add(width.saturating_sub(1));
+            if cell_end >= start_column && column <= end_column {
+                line.push_str(cell.contents());
+            }
+        }
+        if row_index < end.row && row.wrapped() {
+            output.push_str(&line);
+        } else {
+            output.push_str(line.trim_end_matches(' '));
+            if row_index < end.row {
+                output.push('\n');
+            }
+        }
+    }
+    output
 }
 
 fn anchored_terminal_scrollback(
@@ -3357,13 +3741,15 @@ fn push_sgr_color(parameters: &mut Vec<String>, color: Color, foreground: bool) 
 #[cfg(test)]
 mod tests {
     use super::{
-        App, Command, DEFAULT_FILE_TREE_WIDTH, Mode, ParsedSubstitute, SplitAxis,
-        anchored_terminal_scrollback, display_width, parse_command, parse_substitute_expression,
-        render_text_with_selection, sgr_attributes,
+        App, Command, DEFAULT_FILE_TREE_WIDTH, Mode, ParsedSubstitute, SplitAxis, TerminalPosition,
+        TerminalSelection, anchored_terminal_scrollback, display_width, move_terminal_position,
+        parse_command, parse_substitute_expression, render_terminal_row,
+        render_text_with_selection, sgr_attributes, shift_terminal_selection,
+        terminal_selection_text,
     };
     use bed_core::{Document, Editor, SelectionKind, SubstituteOptions, SubstituteRange};
     use bed_terminal::{Key, TerminalSize};
-    use bed_vt100::{Attributes, Color};
+    use bed_vt100::{Attributes, Color, TerminalEmulator};
     use std::{
         path::PathBuf,
         sync::atomic::{AtomicUsize, Ordering},
@@ -3397,6 +3783,122 @@ mod tests {
             }),
             "\x1b[38;5;200m"
         );
+    }
+
+    #[test]
+    fn terminal_selection_handles_wide_cells_reverse_ranges_and_soft_wraps() {
+        let mut terminal = TerminalEmulator::new(3, 5, 10);
+        terminal.process("a好b\r\nabcdeX".as_bytes());
+        let history = terminal.screen().scrollback().len();
+
+        assert_eq!(
+            terminal_selection_text(
+                terminal.screen(),
+                TerminalSelection {
+                    anchor: TerminalPosition {
+                        row: history + 1,
+                        column: 4,
+                    },
+                    cursor: TerminalPosition {
+                        row: history,
+                        column: 2,
+                    },
+                },
+            ),
+            "好b\nabcde"
+        );
+        assert!(terminal.screen().rows()[1].wrapped());
+        assert_eq!(
+            terminal_selection_text(
+                terminal.screen(),
+                TerminalSelection {
+                    anchor: TerminalPosition {
+                        row: history + 1,
+                        column: 3,
+                    },
+                    cursor: TerminalPosition {
+                        row: history + 2,
+                        column: 0,
+                    },
+                },
+            ),
+            "deX"
+        );
+
+        let wide = TerminalPosition {
+            row: history,
+            column: 1,
+        };
+        assert_eq!(
+            move_terminal_position(terminal.screen(), wide, 0, 1).column,
+            3
+        );
+        assert_eq!(
+            move_terminal_position(
+                terminal.screen(),
+                TerminalPosition {
+                    row: history,
+                    column: 3,
+                },
+                0,
+                -1,
+            )
+            .column,
+            1
+        );
+
+        let mut spaces = TerminalEmulator::new(2, 5, 0);
+        spaces.process(b"abc  X");
+        assert_eq!(
+            terminal_selection_text(
+                spaces.screen(),
+                TerminalSelection {
+                    anchor: TerminalPosition { row: 0, column: 0 },
+                    cursor: TerminalPosition { row: 1, column: 0 },
+                },
+            ),
+            "abc  X"
+        );
+    }
+
+    #[test]
+    fn terminal_selection_rendering_toggles_existing_inverse_cells() {
+        let mut terminal = TerminalEmulator::new(1, 4, 0);
+        terminal.process(b"a\x1b[7mb\x1b[0mc");
+        let mut output = Vec::new();
+        render_terminal_row(
+            &mut output,
+            terminal.screen().row(0).unwrap(),
+            4,
+            Some((
+                0,
+                TerminalSelection {
+                    anchor: TerminalPosition { row: 0, column: 0 },
+                    cursor: TerminalPosition { row: 0, column: 2 },
+                },
+            )),
+        );
+        let rendered = String::from_utf8(output).unwrap();
+
+        assert!(rendered.contains("\x1b[7ma"));
+        assert!(rendered.contains("\x1b[mb"));
+        assert!(rendered.contains("\x1b[7mc"));
+    }
+
+    #[test]
+    fn terminal_selection_is_clamped_or_cleared_when_history_is_discarded() {
+        let selection = TerminalSelection {
+            anchor: TerminalPosition { row: 2, column: 1 },
+            cursor: TerminalPosition { row: 5, column: 3 },
+        };
+        assert_eq!(
+            shift_terminal_selection(selection, 3),
+            Some(TerminalSelection {
+                anchor: TerminalPosition { row: 0, column: 1 },
+                cursor: TerminalPosition { row: 2, column: 3 },
+            })
+        );
+        assert_eq!(shift_terminal_selection(selection, 6), None);
     }
 
     #[test]
@@ -3515,6 +4017,47 @@ mod tests {
         execute(&mut app, &format!("terminalclose! {}", session_id.get()));
         assert!(app.terminals.get(session_id).is_none());
         assert!(app.message.contains("closed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_visual_yanks_into_the_shared_bed_register() {
+        use std::{
+            thread,
+            time::{Duration, Instant},
+        };
+
+        let mut app = app_with(b"");
+        execute(&mut app, "terminal printf COPY");
+        let session_id = app.active_terminal_session_id().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.terminals.get(session_id).is_some_and(|session| {
+            session.status().is_none()
+                || !session.reached_eof()
+                || !session.screen().contents().contains("COPY")
+        }) {
+            app.poll_terminals().unwrap();
+            assert!(
+                Instant::now() < deadline,
+                "terminal copy output did not finish"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+
+        app.handle_key(Key::Char('v')).unwrap();
+        assert_eq!(app.mode(), Mode::TerminalVisual);
+        app.handle_key(Key::Char('0')).unwrap();
+        app.handle_key(Key::Char('y')).unwrap();
+        assert_eq!(app.mode(), Mode::TerminalNormal);
+        assert_eq!(
+            app.register,
+            Some(super::Register::Character(b"COPY".to_vec()))
+        );
+
+        app.handle_key(Key::Ctrl('w')).unwrap();
+        app.handle_key(Key::Char('w')).unwrap();
+        app.handle_key(Key::Char('p')).unwrap();
+        assert_eq!(app.editor().document().as_bytes(), b"COPY");
     }
 
     #[cfg(unix)]
