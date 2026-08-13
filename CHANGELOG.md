@@ -10,6 +10,7 @@ All notable changes to bed are documented in this file.
   bounded terminal sessions, and embedded terminal splits.
 - Terminal Input and Terminal Normal modes with explicit child-input escape,
   window commands, and view-local scrollback navigation.
+- Terminal session listing, reattachment, and explicit process cleanup commands.
 
 ## [0.3.0] - 2026-08-13
 

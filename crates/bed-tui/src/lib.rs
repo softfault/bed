@@ -111,6 +111,12 @@ enum Command<'a> {
     TreeWidth(Option<&'a str>),
     RefreshTree,
     Terminal(Option<&'a str>),
+    ListTerminals,
+    AttachTerminal(Option<&'a str>),
+    CloseTerminal {
+        force: bool,
+        id: Option<&'a str>,
+    },
     Substitute {
         range: SubstituteRange,
         expression: &'a str,
@@ -1354,6 +1360,18 @@ impl App {
             Command::TreeWidth(None) => self.message.push_str("File tree width required"),
             Command::RefreshTree => self.refresh_tree(),
             Command::Terminal(command) => self.open_terminal(command),
+            Command::ListTerminals => self.list_terminal_sessions(),
+            Command::AttachTerminal(Some(id)) => self.attach_terminal_id(id),
+            Command::AttachTerminal(None) => self.message.push_str("Terminal session ID required"),
+            Command::CloseTerminal {
+                force,
+                id: Some(id),
+            } => {
+                self.close_terminal_id(id, force);
+            }
+            Command::CloseTerminal { id: None, .. } => {
+                self.message.push_str("Terminal session ID required");
+            }
             Command::Substitute { range, expression } => self.execute_substitute(range, expression),
             Command::Empty => {}
             Command::Unknown(command) => self
@@ -1636,6 +1654,12 @@ impl App {
             },
         );
 
+        self.open_terminal_view(view_id, true);
+    }
+
+    fn open_terminal_view(&mut self, view_id: TerminalViewId, input: bool) {
+        debug_assert!(self.terminal_views.contains_key(&view_id));
+
         let source = self.active_window().view_id;
         let text_view = self
             .editor
@@ -1651,7 +1675,94 @@ impl App {
         window.content = WindowContent::Terminal(view_id);
         self.windows.insert(window_id, window);
         self.activate_window(window_id);
-        self.mode = Mode::TerminalInput;
+        if input {
+            self.mode = Mode::TerminalInput;
+        }
+    }
+
+    fn terminal_session_id(&self, value: &str) -> Option<TerminalSessionId> {
+        let number = value.parse::<u64>().ok()?;
+        self.terminals.ids().find(|id| id.get() == number)
+    }
+
+    fn list_terminal_sessions(&mut self) {
+        if let Err(error) = self.terminals.poll() {
+            self.message
+                .push_str(&format!("Terminal status failed: {error:#}"));
+            return;
+        }
+        let ids: Vec<_> = self.terminals.ids().collect();
+        if ids.is_empty() {
+            self.message.push_str("No terminal sessions");
+            return;
+        }
+        let active = self.active_terminal_session_id();
+        for (index, id) in ids.into_iter().enumerate() {
+            if index > 0 {
+                self.message.push_str("  ");
+            }
+            let session = self
+                .terminals
+                .get(id)
+                .expect("collected terminal session ID remains present");
+            let marker = if active == Some(id) { '%' } else { ' ' };
+            let state = session
+                .status()
+                .map_or_else(|| "running".to_owned(), |status| format!("exited {status}"));
+            self.message.push_str(&format!(
+                "{}:{marker} {} [{state}]",
+                id.get(),
+                session.command()
+            ));
+        }
+    }
+
+    fn attach_terminal_id(&mut self, value: &str) {
+        let Some(session_id) = self.terminal_session_id(value) else {
+            self.message
+                .push_str(&format!("Terminal session {value} does not exist"));
+            return;
+        };
+        let view_id = TerminalViewId(self.next_terminal_view_id);
+        self.next_terminal_view_id = self
+            .next_terminal_view_id
+            .checked_add(1)
+            .expect("terminal view ID space exhausted");
+        self.terminal_views.insert(
+            view_id,
+            TerminalView {
+                session_id,
+                scrollback: 0,
+            },
+        );
+        self.open_terminal_view(view_id, false);
+    }
+
+    fn close_terminal_id(&mut self, value: &str, force: bool) {
+        let Some(session_id) = self.terminal_session_id(value) else {
+            self.message
+                .push_str(&format!("Terminal session {value} does not exist"));
+            return;
+        };
+        let view_count = self
+            .terminal_views
+            .values()
+            .filter(|view| view.session_id == session_id)
+            .count();
+        if view_count > 0 {
+            self.message.push_str(&format!(
+                "Terminal session {value} still has {view_count} view(s); close them first"
+            ));
+            return;
+        }
+        match self.terminals.close(session_id, force) {
+            Ok(()) => self
+                .message
+                .push_str(&format!("Terminal session {value} closed")),
+            Err(error) => self
+                .message
+                .push_str(&format!("Terminal close failed: {error:#}")),
+        }
     }
 
     fn resize_terminal_view(&mut self, view_id: TerminalViewId, area: Rect) {
@@ -2836,6 +2947,10 @@ fn parse_command(input: &str) -> Command<'_> {
         ("treewidth", width) => Command::TreeWidth(width),
         ("treerefresh", None) => Command::RefreshTree,
         ("terminal" | "term", command) => Command::Terminal(command),
+        ("terminals", None) => Command::ListTerminals,
+        ("terminalattach", id) => Command::AttachTerminal(id),
+        ("terminalclose", id) => Command::CloseTerminal { force: false, id },
+        ("terminalclose!", id) => Command::CloseTerminal { force: true, id },
         _ => Command::Unknown(input),
     }
 }
@@ -3292,6 +3407,25 @@ mod tests {
             Command::Terminal(Some("printf ready"))
         );
         assert_eq!(parse_command("te"), Command::Unknown("te"));
+        assert_eq!(parse_command("terminals"), Command::ListTerminals);
+        assert_eq!(
+            parse_command("terminalattach 12"),
+            Command::AttachTerminal(Some("12"))
+        );
+        assert_eq!(
+            parse_command("terminalclose 12"),
+            Command::CloseTerminal {
+                force: false,
+                id: Some("12")
+            }
+        );
+        assert_eq!(
+            parse_command("terminalclose! 12"),
+            Command::CloseTerminal {
+                force: true,
+                id: Some("12")
+            }
+        );
     }
 
     fn execute(app: &mut App, command: &str) {
@@ -3351,6 +3485,36 @@ mod tests {
         assert_eq!(app.mode(), Mode::Normal);
         assert!(!app.terminal_views.contains_key(&view_id));
         assert!(app.terminals.get(session_id).is_some());
+
+        execute(&mut app, "terminals");
+        assert!(app.message.contains(&format!("{}: ", session_id.get())));
+        assert!(app.message.contains("[exited"));
+        execute(&mut app, &format!("terminalattach {}", session_id.get()));
+        assert_eq!(app.mode(), Mode::TerminalNormal);
+        assert_eq!(app.active_terminal_session_id(), Some(session_id));
+        execute(&mut app, &format!("terminalclose {}", session_id.get()));
+        assert!(app.message.contains("still has 1 view(s)"));
+        app.close_active_window();
+        execute(&mut app, &format!("terminalclose {}", session_id.get()));
+        assert!(app.terminals.get(session_id).is_none());
+        assert!(app.message.contains("closed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn running_terminal_sessions_require_forced_cleanup_after_detach() {
+        let mut app = app_with(b"");
+        execute(&mut app, "terminal sleep 30");
+        let session_id = app.active_terminal_session_id().unwrap();
+        app.close_active_window();
+
+        execute(&mut app, &format!("terminalclose {}", session_id.get()));
+        assert!(app.terminals.get(session_id).is_some());
+        assert!(app.message.contains("still running"));
+
+        execute(&mut app, &format!("terminalclose! {}", session_id.get()));
+        assert!(app.terminals.get(session_id).is_none());
+        assert!(app.message.contains("closed"));
     }
 
     #[cfg(unix)]

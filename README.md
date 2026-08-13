@@ -69,6 +69,23 @@ Visual commands are intentionally bed-specific. Entering `:` does not insert
 Vim's `'<,'>` range markers, and an explicit `:%s` still addresses the whole
 buffer.
 
+Terminal Input mode:
+
+- Keys and bracketed paste are sent to the child session.
+- `Ctrl-\ Ctrl-N`: enter Terminal Normal mode.
+- `Ctrl-\ Ctrl-W`: apply one bed window command.
+- `Ctrl-\ Ctrl-\`: send a literal `Ctrl-\` to the child.
+
+Terminal Normal mode:
+
+- `j` / `k`, arrows, page keys, `Ctrl-U`, and `Ctrl-D`: navigate view-local scrollback.
+- `G` or End: return to live output.
+- `i`, `a`, or Enter: return to Terminal Input and live output.
+- `Ctrl-W`: apply one bed window command; `:` enters command mode.
+
+Terminal modes are intentionally bed-specific and do not promise Vim terminal
+compatibility.
+
 Commands:
 
 - `:w`: save unless the file changed externally; `:w!` explicitly overwrites it
@@ -91,6 +108,10 @@ Commands:
 - `:tabnext [N]` / `:tabprevious`: switch tab pages, optionally selecting 1-based position `N`
 - `:tabmove N`: move the current tab to 1-based position `N`
 - `:tabclose` / `:tabonly`: close the current tab page or all other tab pages
+- `:terminal [COMMAND]`: open a shell or command in a new terminal split
+- `:terminals`: list terminal sessions by stable ID
+- `:terminalattach ID`: attach another view to an existing session
+- `:terminalclose ID`: remove an exited detached session; append `!` to terminate a running one
 - `:q`: quit if no open buffer has unsaved changes
 - `:q!`: discard all changes and quit
 - `:wq` or `:x`: save the current buffer and quit if every buffer is clean

@@ -48,6 +48,12 @@ Several views may refer to one running session, but only the focused view owns
 its PTY dimensions. A view scrolled into history remains anchored as output
 arrives, including after the bounded history reaches capacity.
 
+Closing a terminal window detaches its view without implicitly terminating the
+session. `:terminals` lists retained sessions, `:terminalattach ID` creates a
+new view, and `:terminalclose[!] ID` removes an unviewed session, optionally
+terminating a running process. This keeps process lifetime distinct from layout
+lifetime without leaving hidden sessions unmanaged.
+
 ## Compatibility scope
 
 The first implementation covers sequences emitted by common shells and
