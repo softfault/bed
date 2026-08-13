@@ -1,6 +1,7 @@
 use crate::screen::{Attributes, Color, Screen, TerminalModes};
 
 const ESC: u8 = 0x1b;
+const MAX_CSI_BYTES: usize = 256;
 const MAX_OSC_BYTES: usize = 4096;
 const REPLACEMENT_CHARACTER: char = '\u{fffd}';
 
@@ -10,7 +11,10 @@ enum ParserState {
     Ground,
     Escape,
     EscapeIntermediate,
-    Csi(Vec<u8>),
+    Csi {
+        bytes: Vec<u8>,
+        overflowed: bool,
+    },
     Osc {
         bytes: Vec<u8>,
         escape: bool,
@@ -36,6 +40,7 @@ pub struct TerminalEmulator {
     bell_count: usize,
     visual_bell_count: usize,
     reset_count: u64,
+    screen_generation: u64,
     scrollback_capacity: usize,
 }
 
@@ -55,6 +60,7 @@ impl TerminalEmulator {
             bell_count: 0,
             visual_bell_count: 0,
             reset_count: 0,
+            screen_generation: 0,
             scrollback_capacity,
         }
     }
@@ -122,6 +128,10 @@ impl TerminalEmulator {
         self.reset_count
     }
 
+    pub fn screen_generation(&self) -> u64 {
+        self.screen_generation
+    }
+
     pub fn take_responses(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.responses)
     }
@@ -151,21 +161,32 @@ impl TerminalEmulator {
                     self.state = ParserState::Ground;
                 }
             }
-            ParserState::Csi(mut bytes) => {
+            ParserState::Csi {
+                mut bytes,
+                mut overflowed,
+            } => {
                 if byte == ESC {
                     self.unsupported_sequences += 1;
                     self.state = ParserState::Escape;
                 } else if matches!(byte, 0x18 | 0x1a) {
                     self.state = ParserState::Ground;
                 } else if (0x40..=0x7e).contains(&byte) {
-                    self.dispatch_csi(&bytes, byte);
+                    if overflowed {
+                        self.unsupported_sequences = self.unsupported_sequences.saturating_add(1);
+                    } else {
+                        self.dispatch_csi(&bytes, byte);
+                    }
                     self.state = ParserState::Ground;
-                } else if (0x20..=0x3f).contains(&byte) && bytes.len() < 256 {
-                    bytes.push(byte);
-                    self.state = ParserState::Csi(bytes);
+                } else if (0x20..=0x3f).contains(&byte) {
+                    if bytes.len() < MAX_CSI_BYTES {
+                        bytes.push(byte);
+                    } else {
+                        overflowed = true;
+                    }
+                    self.state = ParserState::Csi { bytes, overflowed };
                 } else if byte < 0x20 {
                     self.execute_control(byte);
-                    self.state = ParserState::Csi(bytes);
+                    self.state = ParserState::Csi { bytes, overflowed };
                 } else {
                     self.unsupported_sequences += 1;
                     self.state = ParserState::Ground;
@@ -247,9 +268,17 @@ impl TerminalEmulator {
             self.flush_incomplete_utf8();
             self.execute_control(byte);
             self.state = ParserState::Ground;
+        } else if !self.utf8.is_empty() {
+            self.process_utf8_byte(byte);
         } else if byte < 0x80 {
             self.flush_incomplete_utf8();
             self.print_character(char::from(byte));
+            self.state = ParserState::Ground;
+        } else if byte <= 0x9f {
+            // C1 controls are non-printing. The terminal uses 7-bit CSI/OSC
+            // forms, but ignoring their 8-bit forms matches vt100's recovery
+            // behavior and prevents them from becoming replacement glyphs.
+            self.flush_incomplete_utf8();
             self.state = ParserState::Ground;
         } else {
             self.process_utf8_byte(byte);
@@ -258,7 +287,12 @@ impl TerminalEmulator {
 
     fn process_escape(&mut self, byte: u8) {
         match byte {
-            b'[' => self.state = ParserState::Csi(Vec::new()),
+            b'[' => {
+                self.state = ParserState::Csi {
+                    bytes: Vec::new(),
+                    overflowed: false,
+                };
+            }
             b']' => {
                 self.state = ParserState::Osc {
                     bytes: Vec::new(),
@@ -591,6 +625,7 @@ impl TerminalEmulator {
                 self.primary.restore_cursor();
             }
         }
+        self.screen_generation = self.screen_generation.saturating_add(1);
     }
 
     fn device_status(&mut self, status: u16, private: bool) {
@@ -639,6 +674,7 @@ impl TerminalEmulator {
         self.title.clear();
         self.responses.clear();
         self.reset_count = self.reset_count.saturating_add(1);
+        self.screen_generation = self.screen_generation.saturating_add(1);
     }
 }
 
@@ -700,7 +736,7 @@ fn apply_extended_color(parameters: &[Option<u16>], color: &mut Color) -> usize 
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_OSC_BYTES, TerminalEmulator};
+    use super::{MAX_CSI_BYTES, MAX_OSC_BYTES, TerminalEmulator};
     use crate::{Color, Screen, TerminalModes};
 
     #[test]
@@ -820,6 +856,20 @@ mod tests {
     }
 
     #[test]
+    fn ignores_bare_c1_controls_without_corrupting_utf8() {
+        let bytes = b"A\x80\x85B\x1b]2;\xc3\x9c title\x07C";
+        for split in 0..=bytes.len() {
+            let mut terminal = TerminalEmulator::new(2, 20, 0);
+            terminal.process(&bytes[..split]);
+            terminal.process(&bytes[split..]);
+
+            assert_eq!(terminal.title(), "\u{dc} title");
+            assert_eq!(terminal.screen().row(0).unwrap().text(), "ABC");
+            assert_eq!(terminal.unsupported_sequence_count(), 0);
+        }
+    }
+
+    #[test]
     fn rejects_oversized_osc_and_recovers_after_its_terminator() {
         let mut terminal = TerminalEmulator::new(2, 20, 0);
         terminal.process(b"\x1b]2;kept\x07");
@@ -835,6 +885,22 @@ mod tests {
 
         terminal.process(b"\x1b]2;recovered\x07");
         assert_eq!(terminal.title(), "recovered");
+    }
+
+    #[test]
+    fn rejects_oversized_csi_without_printing_its_tail() {
+        let mut bytes = b"before\x1b[".to_vec();
+        bytes.extend(std::iter::repeat_n(b'1', MAX_CSI_BYTES + 32));
+        bytes.extend_from_slice(b"mafter");
+
+        for split in 0..=bytes.len() {
+            let mut terminal = TerminalEmulator::new(2, 20, 0);
+            terminal.process(&bytes[..split]);
+            terminal.process(&bytes[split..]);
+
+            assert_eq!(terminal.screen().row(0).unwrap().text(), "beforeafter");
+            assert_eq!(terminal.unsupported_sequence_count(), 1);
+        }
     }
 
     #[test]
@@ -856,7 +922,7 @@ mod tests {
             .process(b"a\xf0\x28\x8c\x28b\xe2\x1b[2COK\x1b[999\x18C\x1bPignored\x1adone\x1b%G!");
 
         let contents = terminal.screen().contents();
-        assert!(contents.contains("a�(�(b"));
+        assert!(contents.contains("a�((b"));
         assert!(contents.contains("OKCdone!"));
         assert_eq!(terminal.unsupported_sequence_count(), 1);
     }
@@ -894,12 +960,26 @@ mod tests {
         let mut terminal = TerminalEmulator::new(2, 8, 10);
         terminal.process(b"one\r\ntwo\r\nthree");
         assert_eq!(terminal.reset_count(), 0);
+        assert_eq!(terminal.screen_generation(), 0);
 
         terminal.process(b"\x1bc");
 
         assert_eq!(terminal.reset_count(), 1);
+        assert_eq!(terminal.screen_generation(), 1);
         assert!(terminal.primary_screen().scrollback().is_empty());
         assert_eq!(terminal.screen().contents(), "\n");
+    }
+
+    #[test]
+    fn alternate_screen_transitions_advance_the_generation() {
+        let mut terminal = TerminalEmulator::new(2, 8, 10);
+
+        terminal.process(b"\x1b[?1049h");
+        assert_eq!(terminal.screen_generation(), 1);
+        terminal.process(b"\x1b[?1049h");
+        assert_eq!(terminal.screen_generation(), 1);
+        terminal.process(b"\x1b[?1049l");
+        assert_eq!(terminal.screen_generation(), 2);
     }
 
     #[test]
@@ -925,6 +1005,20 @@ mod tests {
 
         terminal.process(b"\r\x1b[3g\x1b[5G\x1bH\rX\tY");
         assert_eq!(terminal.screen().cell(0, 4).unwrap().contents(), "Y");
+    }
+
+    #[test]
+    fn row_edits_clear_stale_soft_wrap_markers() {
+        for edit in [b"\x1b[2K".as_slice(), b"\x1b[@", b"\x1b[P"] {
+            let mut terminal = TerminalEmulator::new(2, 4, 0);
+            terminal.process(b"abcdX");
+            assert!(terminal.screen().row(0).unwrap().wrapped());
+
+            terminal.process(b"\x1b[H");
+            terminal.process(edit);
+
+            assert!(!terminal.screen().row(0).unwrap().wrapped());
+        }
     }
 
     #[test]

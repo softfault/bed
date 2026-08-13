@@ -30,13 +30,17 @@ boundary. Linux tests cover generated-response routing, mode-aware input, EOF
 finalization, exit status, coordinated PTY/emulator resize, stable IDs, and
 forced versus protected session closure. Capacity-one stress cases verify that
 input backpressure is reported and sustained output is drained without loss.
+Generated terminal responses remain pending while that bounded input channel
+is full and are retried before additional child output is consumed.
 Parser, real-PTY session, and TUI tests also verify that audible and visual
 bells are counted per poll and surfaced without emitting host control bytes.
 Mouse tests cover host SGR parsing, native Windows record translation,
 child-mode filtering, coordinate translation, and delivery through a real PTY.
 The TUI additionally starts a real shell command, renders its attributed
 screen in a terminal window, retains its exit state, and detaches the view
-without discarding the session.
+without discarding the session. It also verifies child-controlled cursor
+visibility and clears view-local selection or scrollback when the child changes
+between primary and alternate screens.
 
 ## Cross-Target Checks
 

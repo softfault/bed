@@ -470,7 +470,18 @@ impl App {
         } else {
             BLOCK_CURSOR
         });
-        output.extend_from_slice(b"\x1b[?25h");
+        let cursor_visible = if self.mode == Mode::TerminalInput {
+            self.active_terminal_session_id()
+                .and_then(|id| self.terminals.get(id))
+                .is_some_and(|session| session.screen().cursor().visible)
+        } else {
+            true
+        };
+        output.extend_from_slice(if cursor_visible {
+            b"\x1b[?25h"
+        } else {
+            b"\x1b[?25l"
+        });
         output
     }
 
@@ -743,7 +754,7 @@ impl App {
                         (
                             session.history_rows_pushed(),
                             session.history_rows_discarded(),
-                            session.reset_count(),
+                            session.screen_generation(),
                         ),
                     )
                 })
@@ -757,22 +768,23 @@ impl App {
             .iter_mut()
             .filter(|(_, view)| view.scrollback > 0 || view.selection.is_some())
         {
-            let (before, discarded_before, reset_before) = previous_history
+            let (before, discarded_before, generation_before) = previous_history
                 .get(&view.session_id)
                 .copied()
                 .unwrap_or((0, 0, 0));
-            let (after, discarded_after, reset_after, maximum) = self
-                .terminals
-                .get(view.session_id)
-                .map_or((before, discarded_before, reset_before, 0), |session| {
-                    (
-                        session.history_rows_pushed(),
-                        session.history_rows_discarded(),
-                        session.reset_count(),
-                        session.scrollback_len(),
-                    )
-                });
-            if reset_after != reset_before {
+            let (after, discarded_after, generation_after, maximum) =
+                self.terminals.get(view.session_id).map_or(
+                    (before, discarded_before, generation_before, 0),
+                    |session| {
+                        (
+                            session.history_rows_pushed(),
+                            session.history_rows_discarded(),
+                            session.screen_generation(),
+                            session.scrollback_len(),
+                        )
+                    },
+                );
+            if generation_after != generation_before {
                 view.scrollback = 0;
                 active_selection_cleared |=
                     Some(view_id) == active_terminal_view && view.selection.is_some();
@@ -4127,6 +4139,113 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn terminal_input_respects_child_cursor_visibility() {
+        use std::{
+            thread,
+            time::{Duration, Instant},
+        };
+
+        let mut app = app_with(b"");
+        app.render(TerminalSize {
+            rows: 20,
+            columns: 80,
+        });
+        execute(&mut app, "terminal printf '\\033[?25lREADY'; sleep 30");
+        let session_id = app.active_terminal_session_id().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.terminals.get(session_id).is_some_and(|session| {
+            session.screen().cursor().visible || !session.screen().contents().contains("READY")
+        }) {
+            app.poll_terminals().unwrap();
+            assert!(Instant::now() < deadline, "child did not hide its cursor");
+            thread::sleep(Duration::from_millis(2));
+        }
+
+        let frame = app.render(TerminalSize {
+            rows: 20,
+            columns: 80,
+        });
+        assert!(frame.ends_with(b"\x1b[6 q\x1b[?25l"));
+
+        app.handle_key(Key::Ctrl('\\')).unwrap();
+        app.handle_key(Key::Ctrl('n')).unwrap();
+        let frame = app.render(TerminalSize {
+            rows: 20,
+            columns: 80,
+        });
+        assert!(frame.ends_with(b"\x1b[2 q\x1b[?25h"));
+        app.terminals.close(session_id, true).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn alternate_screen_transition_clears_view_local_history_state() {
+        use std::{
+            thread,
+            time::{Duration, Instant},
+        };
+
+        let mut app = app_with(b"");
+        app.render(TerminalSize {
+            rows: 20,
+            columns: 80,
+        });
+        execute(
+            &mut app,
+            concat!(
+                "terminal stty raw -echo; printf '",
+                "01\\r\\n02\\r\\n03\\r\\n04\\r\\n05\\r\\n06\\r\\n07\\r\\n08\\r\\n",
+                "09\\r\\n10\\r\\n11\\r\\n12\\r\\n13\\r\\n14\\r\\n15\\r\\n16\\r\\n",
+                "17\\r\\n18\\r\\n19\\r\\n20\\r\\nREADY'; ",
+                "dd bs=1 count=1 2>/dev/null; printf '\\033[?1049hALT'; sleep 30"
+            ),
+        );
+        let view_id = app.active_terminal_view_id().unwrap();
+        let session_id = app.active_terminal_session_id().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.terminals.get(session_id).is_some_and(|session| {
+            !session.screen().contents().contains("READY") || session.scrollback_len() == 0
+        }) {
+            app.poll_terminals().unwrap();
+            assert!(Instant::now() < deadline, "child did not fill history");
+            thread::sleep(Duration::from_millis(2));
+        }
+
+        app.handle_key(Key::Ctrl('\\')).unwrap();
+        app.handle_key(Key::Ctrl('n')).unwrap();
+        app.handle_key(Key::Char('k')).unwrap();
+        app.handle_key(Key::Char('v')).unwrap();
+        assert!(app.terminal_views[&view_id].scrollback > 0);
+        assert!(app.terminal_views[&view_id].selection.is_some());
+        app.terminals
+            .get(session_id)
+            .unwrap()
+            .send_bytes(vec![b'x'])
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app
+            .terminals
+            .get(session_id)
+            .is_some_and(|session| !session.screen().contents().contains("ALT"))
+        {
+            app.poll_terminals().unwrap();
+            assert!(
+                Instant::now() < deadline,
+                "child did not enter alternate screen"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        app.poll_terminals().unwrap();
+
+        assert_eq!(app.mode(), Mode::TerminalNormal);
+        assert_eq!(app.terminal_views[&view_id].scrollback, 0);
+        assert!(app.terminal_views[&view_id].selection.is_none());
+        app.terminals.close(session_id, true).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn terminal_mouse_uses_child_coordinates_and_ignores_status_rows() {
         use bed_terminal::{Modifiers, MouseAction, MouseButton, MouseEvent};
         use std::{
@@ -4330,7 +4449,11 @@ mod tests {
         while app
             .active_terminal_session_id()
             .and_then(|id| app.terminals.get(id))
-            .is_some_and(|session| session.status().is_none())
+            .is_some_and(|session| {
+                session.status().is_none()
+                    || !session.reached_eof()
+                    || !session.screen().contents().contains("INPUT_OK")
+            })
         {
             app.poll_terminals().unwrap();
             assert!(

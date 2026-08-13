@@ -300,6 +300,7 @@ impl Screen {
             row.cells
                 .resize_with(columns, || Cell::blank(Attributes::default()));
             row.repair_wide_cells();
+            row.wrapped = false;
         }
         while self.rows.len() > rows {
             let removed = self.rows.remove(0);
@@ -564,6 +565,7 @@ impl Screen {
             row.cells.pop();
         }
         row.repair_wide_cells();
+        row.wrapped = false;
     }
 
     pub(crate) fn delete_cells(&mut self, count: usize) {
@@ -575,6 +577,7 @@ impl Screen {
             row.cells.push(Cell::blank(self.attributes));
         }
         row.repair_wide_cells();
+        row.wrapped = false;
     }
 
     pub(crate) fn erase_cells(&mut self, count: usize) {
@@ -670,6 +673,9 @@ impl Screen {
             self.clear_wide_cell_at(row, column);
             self.rows[row].cells[column] = Cell::blank(self.attributes);
         }
+        if end == self.size().1 {
+            self.rows[row].wrapped = false;
+        }
     }
 
     fn clear_wide_cell_at(&mut self, row: usize, column: usize) {
@@ -708,6 +714,7 @@ fn resized_row(mut row: Row, columns: usize) -> Row {
     row.cells
         .resize_with(columns, || Cell::blank(Attributes::default()));
     row.repair_wide_cells();
+    row.wrapped = false;
     row
 }
 

@@ -20,6 +20,17 @@ All notable changes to bed are documented in this file.
 - Native host mouse input and mode-aware forwarding to focused embedded
   terminals, including SGR coordinates, modifiers, dragging, and wheel events.
 
+### Fixed
+
+- Preserve generated terminal responses while the bounded child-input queue is
+  backpressured, so device-status queries cannot lose their replies.
+- Recover from bare C1 controls and oversized CSI sequences without rendering
+  control bytes or discarded parameter tails as child text.
+- Honor child cursor visibility in Terminal Input and clear view-local history
+  state when switching between primary and alternate screens.
+- Clear stale soft-wrap metadata after row edits and width changes so copied
+  terminal selections retain the correct line boundaries.
+
 ## [0.3.0] - 2026-08-13
 
 ### Added

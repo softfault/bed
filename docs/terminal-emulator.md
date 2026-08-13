@@ -90,7 +90,11 @@ interactive command-line programs:
 Unsupported sequences are ignored safely and counted for diagnostics. The OSC
 payload buffer is limited to 4096 bytes. An oversized string is consumed
 through BEL or ST but rejected as a whole, so a truncated title is never
-applied and parsing resumes at the next byte. The initial implementation
+applied and parsing resumes at the next byte. CSI parameter storage is limited
+to 256 bytes; an oversized sequence is likewise consumed through its final byte
+without exposing its discarded tail as screen text. Bare C1 controls are
+non-printing and ignored without interfering with valid UTF-8 continuation
+bytes. The initial implementation
 excludes sixel, ReGIS, printer control, Tektronix modes, and complete historical
 VT100 hardware emulation.
 

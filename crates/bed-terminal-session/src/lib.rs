@@ -11,7 +11,7 @@ pub use bed_pty::PtySize;
 use bed_terminal::{Key, MouseEvent, encode_child_key, encode_child_mouse};
 use bed_vt100::{Screen, TerminalEmulator, TerminalModes};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     io::{Read, Write},
     process::{Command, ExitStatus},
     sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
@@ -58,6 +58,7 @@ pub struct TerminalSession {
     error: Option<String>,
     command: String,
     size: PtySize,
+    pending_responses: VecDeque<Vec<u8>>,
 }
 
 impl TerminalSession {
@@ -104,6 +105,7 @@ impl TerminalSession {
             error: None,
             command: label,
             size,
+            pending_responses: VecDeque::new(),
         })
     }
 
@@ -155,19 +157,26 @@ impl TerminalSession {
         self.terminal.reset_count()
     }
 
+    pub fn screen_generation(&self) -> u64 {
+        self.terminal.screen_generation()
+    }
+
     pub fn poll(&mut self) -> Result<PollResult> {
         let mut result = PollResult::default();
         let bells_before = self.terminal.bell_count();
         let visual_bells_before = self.terminal.visual_bell_count();
         while result.output_events < OUTPUT_EVENTS_PER_POLL {
+            if !self.flush_pending_responses()? {
+                break;
+            }
             match self.output.try_recv() {
                 Ok(OutputEvent::Bytes(bytes)) => {
                     result.output_events += 1;
                     result.output_bytes += bytes.len();
                     self.terminal.process(&bytes);
                     let responses = self.terminal.take_responses();
-                    if !responses.is_empty() && self.input.is_some() {
-                        self.send_bytes(responses)?;
+                    if !responses.is_empty() {
+                        self.pending_responses.push_back(responses);
                     }
                 }
                 Ok(OutputEvent::Eof) => {
@@ -185,6 +194,7 @@ impl TerminalSession {
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
             }
         }
+        let _ = self.flush_pending_responses()?;
         if self.status.is_none()
             && let Some(status) = self.process.try_wait()?
         {
@@ -198,6 +208,27 @@ impl TerminalSession {
             .visual_bell_count()
             .saturating_sub(visual_bells_before);
         Ok(result)
+    }
+
+    fn flush_pending_responses(&mut self) -> Result<bool> {
+        loop {
+            let Some(response) = self.pending_responses.pop_front() else {
+                return Ok(true);
+            };
+            let Some(input) = self.input.as_ref() else {
+                return Ok(true);
+            };
+            match input.try_send(response) {
+                Ok(()) => {}
+                Err(TrySendError::Full(response)) => {
+                    self.pending_responses.push_front(response);
+                    return Ok(false);
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    bail!("terminal input writer stopped")
+                }
+            }
+        }
     }
 
     pub fn send_key(&self, key: &Key) -> Result<()> {
@@ -489,6 +520,27 @@ mod tests {
             .expect("bounded input queue did not report backpressure");
 
         assert!(error.to_string().contains("input queue is full"));
+    }
+
+    #[test]
+    fn preserves_responses_while_the_input_queue_is_full() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "sleep 30"]);
+        let mut session = TerminalSession::spawn_labeled(
+            command,
+            "response-backpressure".to_owned(),
+            PtySize::new(2, 10).unwrap(),
+            0,
+            1,
+        )
+        .unwrap();
+        let payload = vec![b'x'; 1024 * 1024];
+        while session.send_bytes(payload.clone()).is_ok() {}
+
+        session.pending_responses.push_back(b"response".to_vec());
+        assert!(!session.flush_pending_responses().unwrap());
+
+        assert_eq!(session.pending_responses.front().unwrap(), b"response");
     }
 
     #[test]
