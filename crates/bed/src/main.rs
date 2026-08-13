@@ -25,6 +25,7 @@ fn main() -> Result<()> {
                 TerminalEvent::Resize(resized) => size = resized,
             }
         }
+        app.poll_terminals()?;
     }
     Ok(())
 }

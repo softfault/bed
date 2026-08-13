@@ -13,7 +13,7 @@ The workspace is split into eight packages:
 | `bed-pty` | Native PTY/ConPTY spawning, I/O, resize, status, and teardown | None |
 | `bed-terminal` | Semantic input, child-key encoding, and native terminal backends | `bed-vt100` |
 | `bed-terminal-session` | Embedded terminal lifecycle, bounded byte delivery, and emulator ownership | `bed-pty`, `bed-terminal`, `bed-vt100` |
-| `bed-tui` | Modes, commands, layout, and frame rendering | `bed-core`, `bed-terminal` |
+| `bed-tui` | Modes, commands, layout, and frame rendering | `bed-core`, `bed-terminal`, `bed-terminal-session`, `bed-vt100` |
 | `bed-vt100` | Incremental VT parsing, screen state, modes, and scrollback | None |
 | `bed` | Argument parsing and the main event loop | Application libraries above |
 
@@ -105,10 +105,14 @@ blocking reads and writes to dedicated threads connected through bounded
 channels. Its `poll` API keeps emulator mutation, generated-response routing,
 EOF finalization, process status, and UI-visible errors on the caller thread.
 
-The embedded terminal planned for 0.4.0 uses `bed-vt100`, an independently
-written terminal emulator maintained in this workspace. Terminal-emulation
-state remains separate from the native PTY/ConPTY process boundary and from UI
-placement. Its compatibility scope and release gates are defined in
+The embedded terminal under development for 0.4.0 uses `bed-vt100`, an
+independently written terminal emulator maintained in this workspace.
+`:terminal [COMMAND]` now creates an independent session in a bottom split;
+the TUI renders child cells, attributes, cursor, status, and view-local
+scrollback state. Child input and Terminal Normal interaction remain gated for
+the next stage. Terminal-emulation state stays separate from the native
+PTY/ConPTY process boundary and UI placement. Its compatibility scope and
+release gates are defined in
 [`docs/terminal-emulator.md`](docs/terminal-emulator.md).
 
 ## Supported targets

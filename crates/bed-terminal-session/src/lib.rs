@@ -6,7 +6,8 @@
 #![forbid(unsafe_code)]
 
 use anyhow::{Context, Result, bail};
-use bed_pty::{PtyProcess, PtySize};
+use bed_pty::PtyProcess;
+pub use bed_pty::PtySize;
 use bed_terminal::{Key, encode_child_key};
 use bed_vt100::{Screen, TerminalEmulator, TerminalModes};
 use std::{
@@ -53,15 +54,25 @@ pub struct TerminalSession {
     status: Option<ExitStatus>,
     eof: bool,
     error: Option<String>,
+    command: String,
+    size: PtySize,
 }
 
 impl TerminalSession {
     pub fn spawn(command: Command, size: PtySize, scrollback_capacity: usize) -> Result<Self> {
-        Self::spawn_with_queue_capacity(command, size, scrollback_capacity, DEFAULT_QUEUE_CAPACITY)
+        let label = command.get_program().to_string_lossy().into_owned();
+        Self::spawn_labeled(
+            command,
+            label,
+            size,
+            scrollback_capacity,
+            DEFAULT_QUEUE_CAPACITY,
+        )
     }
 
-    fn spawn_with_queue_capacity(
+    fn spawn_labeled(
         command: Command,
+        label: String,
         size: PtySize,
         scrollback_capacity: usize,
         queue_capacity: usize,
@@ -89,6 +100,8 @@ impl TerminalSession {
             status: None,
             eof: false,
             error: None,
+            command: label,
+            size,
         })
     }
 
@@ -114,6 +127,14 @@ impl TerminalSession {
 
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()
+    }
+
+    pub fn command(&self) -> &str {
+        &self.command
+    }
+
+    pub fn size(&self) -> PtySize {
+        self.size
     }
 
     pub fn poll(&mut self) -> Result<PollResult> {
@@ -175,9 +196,15 @@ impl TerminalSession {
     }
 
     pub fn resize(&mut self, size: PtySize) -> Result<()> {
-        self.process.resize(size)?;
+        if self.size == size {
+            return Ok(());
+        }
+        if self.status.is_none() {
+            self.process.resize(size)?;
+        }
         self.terminal
             .set_size(usize::from(size.rows()), usize::from(size.columns()));
+        self.size = size;
         Ok(())
     }
 
@@ -199,6 +226,16 @@ pub struct TerminalStore {
     next_id: u64,
 }
 
+impl std::fmt::Debug for TerminalStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TerminalStore")
+            .field("session_count", &self.sessions.len())
+            .field("next_id", &self.next_id)
+            .finish()
+    }
+}
+
 impl TerminalStore {
     pub fn new() -> Self {
         Self::default()
@@ -210,12 +247,33 @@ impl TerminalStore {
         size: PtySize,
         scrollback_capacity: usize,
     ) -> Result<TerminalSessionId> {
+        let session = TerminalSession::spawn(command, size, scrollback_capacity)?;
+        self.insert(session)
+    }
+
+    pub fn spawn_shell(
+        &mut self,
+        command: Option<&str>,
+        size: PtySize,
+        scrollback_capacity: usize,
+    ) -> Result<TerminalSessionId> {
+        let (command, label) = shell_command(command);
+        let session = TerminalSession::spawn_labeled(
+            command,
+            label,
+            size,
+            scrollback_capacity,
+            DEFAULT_QUEUE_CAPACITY,
+        )?;
+        self.insert(session)
+    }
+
+    fn insert(&mut self, session: TerminalSession) -> Result<TerminalSessionId> {
         let id = TerminalSessionId(self.next_id);
         self.next_id = self
             .next_id
             .checked_add(1)
             .context("terminal session ID space exhausted")?;
-        let session = TerminalSession::spawn(command, size, scrollback_capacity)?;
         self.sessions.insert(id, session);
         Ok(id)
     }
@@ -311,6 +369,28 @@ fn spawn_output_thread(
     Ok(())
 }
 
+#[cfg(unix)]
+fn shell_command(command: Option<&str>) -> (Command, String) {
+    let shell = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into());
+    let mut process = Command::new(&shell);
+    let label = command.map_or_else(|| shell.to_string_lossy().into_owned(), str::to_owned);
+    if let Some(command) = command {
+        process.args(["-c", command]);
+    }
+    (process, label)
+}
+
+#[cfg(windows)]
+fn shell_command(command: Option<&str>) -> (Command, String) {
+    let shell = std::env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into());
+    let mut process = Command::new(&shell);
+    let label = command.map_or_else(|| shell.to_string_lossy().into_owned(), str::to_owned);
+    if let Some(command) = command {
+        process.args(["/D", "/S", "/C", command]);
+    }
+    (process, label)
+}
+
 fn spawn_input_thread(
     mut writer: std::fs::File,
     receiver: Receiver<Vec<u8>>,
@@ -361,9 +441,14 @@ mod tests {
     fn reports_input_backpressure() {
         let mut command = Command::new("/bin/sh");
         command.args(["-c", "sleep 30"]);
-        let session =
-            TerminalSession::spawn_with_queue_capacity(command, PtySize::new(2, 10).unwrap(), 0, 1)
-                .unwrap();
+        let session = TerminalSession::spawn_labeled(
+            command,
+            "input-backpressure".to_owned(),
+            PtySize::new(2, 10).unwrap(),
+            0,
+            1,
+        )
+        .unwrap();
         let payload = vec![b'x'; 1024 * 1024];
 
         let error = (0..16)
@@ -381,9 +466,14 @@ mod tests {
             "-c",
             "stty raw -echo; dd if=/dev/zero bs=8192 count=128 2>/dev/null; printf DONE",
         ]);
-        let mut session =
-            TerminalSession::spawn_with_queue_capacity(command, PtySize::new(2, 10).unwrap(), 0, 1)
-                .unwrap();
+        let mut session = TerminalSession::spawn_labeled(
+            command,
+            "output-backpressure".to_owned(),
+            PtySize::new(2, 10).unwrap(),
+            0,
+            1,
+        )
+        .unwrap();
         thread::sleep(Duration::from_millis(20));
 
         let deadline = Instant::now() + Duration::from_secs(5);

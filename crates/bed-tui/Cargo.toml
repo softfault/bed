@@ -14,5 +14,7 @@ description = "Modal terminal UI, layout, commands, and rendering for bed"
 anyhow.workspace = true
 bed-core.workspace = true
 bed-terminal.workspace = true
+bed-terminal-session.workspace = true
+bed-vt100.workspace = true
 unicode-segmentation.workspace = true
 unicode-width.workspace = true

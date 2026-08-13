@@ -19,6 +19,8 @@ use bed_core::{
     ViewId,
 };
 use bed_terminal::{Key, SpecialKey, TerminalSize};
+use bed_terminal_session::{TerminalSessionId, TerminalStore};
+use bed_vt100::{Attributes, Color, Row};
 use file_tree::{FileTree, TreeEntryKind};
 use layout::{Direction, Layout, Rect, ResizeAmount, SplitAxis, WindowId, window_in_direction};
 use std::{collections::HashMap, path::PathBuf};
@@ -42,6 +44,7 @@ const DEFAULT_FILE_TREE_WIDTH: usize = 20;
 const MIN_FILE_TREE_WIDTH: usize = 10;
 const MIN_EDITOR_WIDTH: usize = 12;
 const FILE_TREE_HIDE_COLUMNS: usize = 40;
+const TERMINAL_SCROLLBACK_ROWS: usize = 10_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -52,6 +55,7 @@ pub enum Mode {
     Command,
     Search,
     Tree,
+    Terminal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,6 +109,7 @@ enum Command<'a> {
     Tree(Option<&'a str>),
     TreeWidth(Option<&'a str>),
     RefreshTree,
+    Terminal(Option<&'a str>),
     Substitute {
         range: SubstituteRange,
         expression: &'a str,
@@ -127,9 +132,25 @@ struct Viewport {
 
 #[derive(Debug)]
 struct Window {
+    content: WindowContent,
     view_id: ViewId,
     views: HashMap<BufferId, ViewId>,
     viewports: HashMap<BufferId, Viewport>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowContent {
+    Text,
+    Terminal(TerminalViewId),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct TerminalViewId(u64);
+
+#[derive(Clone, Copy, Debug)]
+struct TerminalView {
+    session_id: TerminalSessionId,
+    scrollback: usize,
 }
 
 #[derive(Debug)]
@@ -149,6 +170,7 @@ struct TabId(u64);
 impl Window {
     fn new(buffer_id: BufferId, view_id: ViewId, viewport: Viewport) -> Self {
         Self {
+            content: WindowContent::Text,
             view_id,
             views: HashMap::from([(buffer_id, view_id)]),
             viewports: HashMap::from([(buffer_id, viewport)]),
@@ -169,6 +191,9 @@ impl Default for Viewport {
 #[derive(Debug)]
 pub struct App {
     editor: Editor,
+    terminals: TerminalStore,
+    terminal_views: HashMap<TerminalViewId, TerminalView>,
+    next_terminal_view_id: u64,
     mode: Mode,
     command: String,
     command_selection: Option<SelectionKind>,
@@ -214,6 +239,9 @@ impl App {
         )]);
         Self {
             editor,
+            terminals: TerminalStore::new(),
+            terminal_views: HashMap::new(),
+            next_terminal_view_id: 0,
             mode: Mode::Normal,
             command: String::new(),
             command_selection: None,
@@ -265,6 +293,7 @@ impl App {
             Mode::Command => self.handle_command_key(key)?,
             Mode::Search => self.handle_search_key(key),
             Mode::Tree => self.handle_tree_key(key),
+            Mode::Terminal => self.handle_terminal_key(key),
         }
         Ok(())
     }
@@ -291,19 +320,32 @@ impl App {
         let tree_cursor = self.render_file_tree(&mut output, rows, columns);
         let mut editor_cursor = (1, 1);
         for (window_id, area) in rectangles {
-            let view_id = self
-                .windows
-                .get(&window_id)
-                .expect("layout references a missing window")
-                .view_id;
-            let switched = self.editor.switch_view(view_id);
-            debug_assert!(switched);
-            if window_id == active_window && self.mode != Mode::Insert {
-                self.editor.normalize_normal_cursor();
-            }
-            self.render_window(&mut output, window_id, area);
-            if window_id == active_window {
-                editor_cursor = self.window_cursor(area);
+            let (content, view_id) = {
+                let window = self
+                    .windows
+                    .get(&window_id)
+                    .expect("layout references a missing window");
+                (window.content, window.view_id)
+            };
+            match content {
+                WindowContent::Text => {
+                    let switched = self.editor.switch_view(view_id);
+                    debug_assert!(switched);
+                    if window_id == active_window && self.mode != Mode::Insert {
+                        self.editor.normalize_normal_cursor();
+                    }
+                    self.render_window(&mut output, window_id, area);
+                    if window_id == active_window {
+                        editor_cursor = self.window_cursor(area);
+                    }
+                }
+                WindowContent::Terminal(terminal_view) => {
+                    self.resize_terminal_view(terminal_view, area);
+                    self.render_terminal_window(&mut output, terminal_view, area);
+                    if window_id == active_window {
+                        editor_cursor = self.terminal_cursor(terminal_view, area);
+                    }
+                }
             }
         }
         let switched = self.editor.switch_view(active_view);
@@ -312,9 +354,12 @@ impl App {
         let prompt = match self.mode {
             Mode::Command => format!(":{}", self.command),
             Mode::Search => format!("/{}", self.search),
-            Mode::Normal | Mode::Insert | Mode::Visual | Mode::VisualLine | Mode::Tree => {
-                self.message.clone()
-            }
+            Mode::Normal
+            | Mode::Insert
+            | Mode::Visual
+            | Mode::VisualLine
+            | Mode::Tree
+            | Mode::Terminal => self.message.clone(),
         };
         let prompt_width = display_width(&prompt);
         // Reserve the last cell for the command cursor and horizontally scroll
@@ -330,7 +375,9 @@ impl App {
         let (cursor_row, cursor_column) = match self.mode {
             Mode::Command | Mode::Search => (rows, prompt_width.saturating_sub(prompt_offset) + 1),
             Mode::Tree => tree_cursor,
-            Mode::Normal | Mode::Insert | Mode::Visual | Mode::VisualLine => editor_cursor,
+            Mode::Normal | Mode::Insert | Mode::Visual | Mode::VisualLine | Mode::Terminal => {
+                editor_cursor
+            }
         };
         move_to(
             &mut output,
@@ -414,6 +461,71 @@ impl App {
                 output.extend_from_slice(VERTICAL_SEPARATOR);
             }
         }
+    }
+
+    fn render_terminal_window(&self, output: &mut Vec<u8>, view_id: TerminalViewId, area: Rect) {
+        if area.columns == 0 || area.rows == 0 {
+            return;
+        }
+        let view = self
+            .terminal_views
+            .get(&view_id)
+            .expect("terminal window references a missing view");
+        let session = self
+            .terminals
+            .get(view.session_id)
+            .expect("terminal view references a missing session");
+        let screen = session.screen();
+        let text_rows = area.rows.saturating_sub(1);
+        let history = screen.scrollback();
+        let visible_start = history.len().saturating_sub(view.scrollback);
+        let rows = history
+            .iter()
+            .skip(visible_start)
+            .chain(screen.rows().iter())
+            .take(text_rows);
+        for (screen_row, row) in rows.enumerate() {
+            move_to(output, area.row + screen_row + 1, area.column + 1);
+            render_terminal_row(output, row, area.columns);
+        }
+        output.extend_from_slice(RESET_STYLE);
+
+        move_to(output, area.row + area.rows, area.column + 1);
+        output.extend_from_slice(REVERSE_VIDEO);
+        let state = if let Some(status) = session.status() {
+            format!("exited {status}")
+        } else if session.error().is_some() {
+            "error".to_owned()
+        } else {
+            "running".to_owned()
+        };
+        let label = format!(" TERMINAL {} [{state}]", session.command());
+        let mut label = render_text(label.as_bytes(), 0, area.columns);
+        let used = display_width(&label);
+        label.extend(std::iter::repeat_n(' ', area.columns.saturating_sub(used)));
+        output.extend_from_slice(label.as_bytes());
+        output.extend_from_slice(RESET_STYLE);
+
+        if area.column > 0 {
+            for row in area.row..area.row + area.rows {
+                move_to(output, row + 1, area.column);
+                output.extend_from_slice(VERTICAL_SEPARATOR);
+            }
+        }
+    }
+
+    fn terminal_cursor(&self, view_id: TerminalViewId, area: Rect) -> (usize, usize) {
+        let Some(view) = self.terminal_views.get(&view_id) else {
+            return (area.row + 1, area.column + 1);
+        };
+        let Some(session) = self.terminals.get(view.session_id) else {
+            return (area.row + 1, area.column + 1);
+        };
+        let cursor = session.screen().cursor();
+        (
+            area.row + cursor.row.min(area.rows.saturating_sub(2)) + 1,
+            area.column + cursor.column.min(area.columns.saturating_sub(1)) + 1,
+        )
     }
 
     fn render_file_tree(
@@ -504,6 +616,31 @@ impl App {
 
     pub fn should_quit(&self) -> bool {
         self.should_quit
+    }
+
+    pub fn poll_terminals(&mut self) -> Result<bool> {
+        let activity = self.terminals.poll()?;
+        for (id, _) in &activity {
+            if let Some(error) = self.terminals.get(*id).and_then(|session| session.error()) {
+                self.message
+                    .push_str(&format!("Terminal {} failed: {error}", id.get()));
+            }
+        }
+        Ok(!activity.is_empty())
+    }
+
+    fn handle_terminal_key(&mut self, key: Key) {
+        match key {
+            Key::Char(':') => self.enter_command_mode(None),
+            Key::Ctrl('w') => self.pending = Some(Pending::Window),
+            Key::Escape => self.pending = None,
+            key if self.pending.take() == Some(Pending::Window) => {
+                self.execute_window_key(&key, None, false);
+            }
+            _ => self
+                .message
+                .push_str("Terminal input is not enabled in this build stage"),
+        }
     }
 
     fn handle_normal_key(&mut self, key: Key) -> Result<()> {
@@ -885,13 +1022,13 @@ impl App {
         match key {
             Key::Escape | Key::Ctrl('c') => {
                 self.cancel_command_selection();
-                self.mode = Mode::Normal;
+                self.set_mode_for_active_window();
                 self.command.clear();
             }
             Key::Backspace => {
                 if self.command.pop().is_none() {
                     self.cancel_command_selection();
-                    self.mode = Mode::Normal;
+                    self.set_mode_for_active_window();
                 }
             }
             Key::Enter => {
@@ -900,6 +1037,9 @@ impl App {
                 self.execute_command(command.trim());
                 self.editor.clear_selection();
                 self.command_selection = None;
+                if self.mode == Mode::Normal {
+                    self.set_mode_for_active_window();
+                }
             }
             Key::Char(character) if !character.is_control() => self.command.push(character),
             _ => {}
@@ -1074,6 +1214,7 @@ impl App {
             Command::TreeWidth(Some(value)) => self.set_tree_width_from_command(value),
             Command::TreeWidth(None) => self.message.push_str("File tree width required"),
             Command::RefreshTree => self.refresh_tree(),
+            Command::Terminal(command) => self.open_terminal(command),
             Command::Substitute { range, expression } => self.execute_substitute(range, expression),
             Command::Empty => {}
             Command::Unknown(command) => self
@@ -1083,6 +1224,20 @@ impl App {
     }
 
     fn quit_if_clean(&mut self) {
+        match self.terminals.running_count() {
+            Ok(count) if count > 0 => {
+                self.message.push_str(&format!(
+                    "{count} terminal session(s) still running (use :q! to terminate)"
+                ));
+                return;
+            }
+            Err(error) => {
+                self.message
+                    .push_str(&format!("Terminal status failed: {error:#}"));
+                return;
+            }
+            Ok(_) => {}
+        }
         match self.editor.dirty_buffer_count() {
             0 => self.should_quit = true,
             count => {
@@ -1309,6 +1464,82 @@ impl App {
         self.activate_window(window_id);
     }
 
+    fn open_terminal(&mut self, command: Option<&str>) {
+        let size = match bed_terminal_session::PtySize::new(8, 80) {
+            Ok(size) => size,
+            Err(error) => {
+                self.message
+                    .push_str(&format!("Terminal size failed: {error:#}"));
+                return;
+            }
+        };
+        let session_id = match self
+            .terminals
+            .spawn_shell(command, size, TERMINAL_SCROLLBACK_ROWS)
+        {
+            Ok(id) => id,
+            Err(error) => {
+                self.message
+                    .push_str(&format!("Terminal failed: {error:#}"));
+                return;
+            }
+        };
+        let view_id = TerminalViewId(self.next_terminal_view_id);
+        self.next_terminal_view_id = self
+            .next_terminal_view_id
+            .checked_add(1)
+            .expect("terminal view ID space exhausted");
+        self.terminal_views.insert(
+            view_id,
+            TerminalView {
+                session_id,
+                scrollback: 0,
+            },
+        );
+
+        let source = self.active_window().view_id;
+        let text_view = self
+            .editor
+            .duplicate_view(source)
+            .expect("active window references a missing editor view");
+        let buffer_id = self.editor.buffer_id();
+        let window_id = self.allocate_window_id();
+        let inserted = self
+            .layout
+            .split(self.active_window, window_id, SplitAxis::Rows);
+        debug_assert!(inserted);
+        let mut window = Window::new(buffer_id, text_view, Viewport::default());
+        window.content = WindowContent::Terminal(view_id);
+        self.windows.insert(window_id, window);
+        self.activate_window(window_id);
+        self.mode = Mode::Terminal;
+    }
+
+    fn resize_terminal_view(&mut self, view_id: TerminalViewId, area: Rect) {
+        let rows = area.rows.saturating_sub(1).max(1);
+        let columns = area.columns.max(1);
+        let (Ok(rows), Ok(columns)) = (u16::try_from(rows), u16::try_from(columns)) else {
+            self.message.push_str("Terminal window is too large");
+            return;
+        };
+        let Ok(size) = bed_terminal_session::PtySize::new(rows, columns) else {
+            return;
+        };
+        let Some(session_id) = self
+            .terminal_views
+            .get(&view_id)
+            .map(|view| view.session_id)
+        else {
+            return;
+        };
+        if let Some(session) = self.terminals.get_mut(session_id)
+            && let Err(error) = session.resize(size)
+        {
+            self.message
+                .push_str(&format!("Terminal resize failed: {error:#}"));
+        }
+    }
+
     fn close_active_window(&mut self) {
         if self.layout.windows().len() == 1 {
             if self.parked_tabs.len() > 1 {
@@ -1341,9 +1572,8 @@ impl App {
         let next_view = self.active_window().view_id;
         let switched = self.editor.switch_view(next_view);
         debug_assert!(switched);
-        for view_id in window.views.into_values() {
-            self.editor.remove_view(view_id);
-        }
+        self.discard_window(window);
+        self.set_mode_for_active_window();
     }
 
     fn keep_only_active_window(&mut self) {
@@ -1356,9 +1586,7 @@ impl App {
             .collect();
         for window_id in closing {
             if let Some(window) = self.windows.remove(&window_id) {
-                for view_id in window.views.into_values() {
-                    self.editor.remove_view(view_id);
-                }
+                self.discard_window(window);
             }
         }
         self.layout = Layout::Window(active);
@@ -1619,6 +1847,10 @@ impl App {
             .retain(|&candidate| candidate != self.active_window);
         self.active_window_history.push(self.active_window);
         self.active_window = window_id;
+        self.mode = match self.active_window().content {
+            WindowContent::Text => Mode::Normal,
+            WindowContent::Terminal(_) => Mode::Terminal,
+        };
     }
 
     fn editor_area(&self) -> Rect {
@@ -1688,6 +1920,7 @@ impl App {
                 .get(&source_id)
                 .expect("layout references a missing window");
             let source_view = source.view_id;
+            let source_content = source.content;
             let source_views: Vec<_> = source
                 .views
                 .iter()
@@ -1707,10 +1940,27 @@ impl App {
                 }
                 views.insert(buffer_id, duplicate);
             }
+            let content = match source_content {
+                WindowContent::Text => WindowContent::Text,
+                WindowContent::Terminal(source_view) => {
+                    let source = *self
+                        .terminal_views
+                        .get(&source_view)
+                        .expect("terminal window references a missing view");
+                    let view_id = TerminalViewId(self.next_terminal_view_id);
+                    self.next_terminal_view_id = self
+                        .next_terminal_view_id
+                        .checked_add(1)
+                        .expect("terminal view ID space exhausted");
+                    self.terminal_views.insert(view_id, source);
+                    WindowContent::Terminal(view_id)
+                }
+            };
             let window_id = self.allocate_window_id();
             self.windows.insert(
                 window_id,
                 Window {
+                    content,
                     view_id: active_view.expect("active window view is missing from its view map"),
                     views,
                     viewports,
@@ -1847,6 +2097,7 @@ impl App {
         let view_id = self.active_window().view_id;
         let switched = self.editor.switch_view(view_id);
         debug_assert!(switched);
+        self.set_mode_for_active_window();
     }
 
     fn close_tab(&mut self) {
@@ -1880,6 +2131,7 @@ impl App {
         let switched = self.editor.switch_view(view_id);
         debug_assert!(switched);
         self.discard_windows(closing.layout.windows());
+        self.set_mode_for_active_window();
     }
 
     fn keep_only_active_tab(&mut self) {
@@ -1931,11 +2183,25 @@ impl App {
     fn discard_windows(&mut self, windows: Vec<WindowId>) {
         for window_id in windows {
             if let Some(window) = self.windows.remove(&window_id) {
-                for view_id in window.views.into_values() {
-                    self.editor.remove_view(view_id);
-                }
+                self.discard_window(window);
             }
         }
+    }
+
+    fn discard_window(&mut self, window: Window) {
+        if let WindowContent::Terminal(view_id) = window.content {
+            self.terminal_views.remove(&view_id);
+        }
+        for view_id in window.views.into_values() {
+            self.editor.remove_view(view_id);
+        }
+    }
+
+    fn set_mode_for_active_window(&mut self) {
+        self.mode = match self.active_window().content {
+            WindowContent::Text => Mode::Normal,
+            WindowContent::Terminal(_) => Mode::Terminal,
+        };
     }
 
     fn show_buffer(&mut self, buffer_id: BufferId) {
@@ -2328,6 +2594,7 @@ impl App {
             (true, Mode::Command) => "COMMAND",
             (true, Mode::Search) => "SEARCH",
             (true, Mode::Tree) => "TREE",
+            (true, Mode::Terminal) => "TERMINAL",
             (false, _) => "",
         };
         let dirty = if self.editor.document().is_dirty() {
@@ -2425,6 +2692,7 @@ fn parse_command(input: &str) -> Command<'_> {
         ("tree", root) => Command::Tree(root),
         ("treewidth", width) => Command::TreeWidth(width),
         ("treerefresh", None) => Command::RefreshTree,
+        ("terminal" | "term", command) => Command::Terminal(command),
         _ => Command::Unknown(input),
     }
 }
@@ -2741,14 +3009,91 @@ fn render_line_number(row: usize, exists: bool, width: usize) -> String {
     }
 }
 
+fn render_terminal_row(output: &mut Vec<u8>, row: &Row, columns: usize) {
+    let mut used = 0;
+    let mut attributes = None;
+    for cell in row.cells() {
+        if cell.is_continuation() || used >= columns {
+            continue;
+        }
+        let width = UnicodeWidthStr::width(cell.contents()).max(1);
+        if used + width > columns {
+            break;
+        }
+        let next = cell.attributes();
+        if attributes != Some(next) {
+            output.extend_from_slice(RESET_STYLE);
+            output.extend_from_slice(sgr_attributes(next).as_bytes());
+            attributes = Some(next);
+        }
+        output.extend_from_slice(cell.contents().as_bytes());
+        used += width;
+    }
+    output.extend_from_slice(RESET_STYLE);
+}
+
+fn sgr_attributes(attributes: Attributes) -> String {
+    let mut parameters = Vec::new();
+    if attributes.bold {
+        parameters.push("1".to_owned());
+    }
+    if attributes.dim {
+        parameters.push("2".to_owned());
+    }
+    if attributes.italic {
+        parameters.push("3".to_owned());
+    }
+    if attributes.underline {
+        parameters.push("4".to_owned());
+    }
+    if attributes.blink {
+        parameters.push("5".to_owned());
+    }
+    if attributes.inverse {
+        parameters.push("7".to_owned());
+    }
+    if attributes.hidden {
+        parameters.push("8".to_owned());
+    }
+    if attributes.strikethrough {
+        parameters.push("9".to_owned());
+    }
+    push_sgr_color(&mut parameters, attributes.foreground, true);
+    push_sgr_color(&mut parameters, attributes.background, false);
+    if parameters.is_empty() {
+        String::new()
+    } else {
+        format!("\x1b[{}m", parameters.join(";"))
+    }
+}
+
+fn push_sgr_color(parameters: &mut Vec<String>, color: Color, foreground: bool) {
+    let base = if foreground { 30 } else { 40 };
+    match color {
+        Color::Default => {}
+        Color::Indexed(index @ 0..=7) => parameters.push((base + u16::from(index)).to_string()),
+        Color::Indexed(index @ 8..=15) => {
+            parameters.push((base + 60 + u16::from(index - 8)).to_string());
+        }
+        Color::Indexed(index) => {
+            parameters.push(format!("{};5;{index}", if foreground { 38 } else { 48 }))
+        }
+        Color::Rgb(red, green, blue) => parameters.push(format!(
+            "{};2;{red};{green};{blue}",
+            if foreground { 38 } else { 48 }
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         App, Command, DEFAULT_FILE_TREE_WIDTH, Mode, ParsedSubstitute, SplitAxis, display_width,
-        parse_command, parse_substitute_expression, render_text_with_selection,
+        parse_command, parse_substitute_expression, render_text_with_selection, sgr_attributes,
     };
     use bed_core::{Document, Editor, SelectionKind, SubstituteOptions, SubstituteRange};
     use bed_terminal::{Key, TerminalSize};
+    use bed_vt100::{Attributes, Color};
     use std::{
         path::PathBuf,
         sync::atomic::{AtomicUsize, Ordering},
@@ -2763,12 +3108,101 @@ mod tests {
         )))
     }
 
+    #[test]
+    fn maps_terminal_cell_attributes_to_outer_sgr() {
+        assert_eq!(
+            sgr_attributes(Attributes {
+                foreground: Color::Indexed(9),
+                background: Color::Rgb(1, 2, 3),
+                bold: true,
+                underline: true,
+                ..Attributes::default()
+            }),
+            "\x1b[1;4;91;48;2;1;2;3m"
+        );
+        assert_eq!(
+            sgr_attributes(Attributes {
+                foreground: Color::Indexed(200),
+                ..Attributes::default()
+            }),
+            "\x1b[38;5;200m"
+        );
+    }
+
+    #[test]
+    fn parses_terminal_commands_without_vim_aliases() {
+        assert_eq!(parse_command("terminal"), Command::Terminal(None));
+        assert_eq!(
+            parse_command("term printf ready"),
+            Command::Terminal(Some("printf ready"))
+        );
+        assert_eq!(parse_command("te"), Command::Unknown("te"));
+    }
+
     fn execute(app: &mut App, command: &str) {
         app.handle_key(Key::Char(':')).unwrap();
         for character in command.chars() {
             app.handle_key(Key::Char(character)).unwrap();
         }
         app.handle_key(Key::Enter).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opens_renders_and_detaches_a_terminal_session() {
+        use std::{
+            thread,
+            time::{Duration, Instant},
+        };
+
+        let mut app = app_with(b"text");
+        app.render(TerminalSize {
+            rows: 20,
+            columns: 80,
+        });
+
+        execute(&mut app, "terminal printf '\\033[31mREADY\\033[0m'");
+
+        assert_eq!(app.mode(), Mode::Terminal);
+        assert_eq!(app.layout.windows().len(), 2);
+        let view_id = match app.active_window().content {
+            super::WindowContent::Terminal(view_id) => view_id,
+            super::WindowContent::Text => panic!("terminal command focused a text window"),
+        };
+        let session_id = app.terminal_views[&view_id].session_id;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.terminals.get(session_id).unwrap().status().is_none() {
+            app.poll_terminals().unwrap();
+            assert!(Instant::now() < deadline, "terminal command did not exit");
+            thread::sleep(Duration::from_millis(2));
+        }
+
+        let frame = app.render(TerminalSize {
+            rows: 20,
+            columns: 80,
+        });
+        assert!(frame.windows(b"READY".len()).any(|bytes| bytes == b"READY"));
+        assert!(frame.windows(5).any(|bytes| bytes == b"\x1b[31m"));
+        assert!(frame.windows(7).any(|bytes| bytes == b"[exited"));
+
+        app.close_active_window();
+        assert_eq!(app.mode(), Mode::Normal);
+        assert!(!app.terminal_views.contains_key(&view_id));
+        assert!(app.terminals.get(session_id).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normal_quit_protects_a_running_terminal_session() {
+        let mut app = app_with(b"");
+        execute(&mut app, "terminal sleep 30");
+
+        execute(&mut app, "q");
+
+        assert!(!app.should_quit());
+        assert!(app.message.contains("terminal session(s) still running"));
+        execute(&mut app, "q!");
+        assert!(app.should_quit());
     }
 
     #[test]
