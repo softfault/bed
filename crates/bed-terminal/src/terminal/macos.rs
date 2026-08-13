@@ -44,7 +44,7 @@ const NCCS: usize = 20;
 // xterm private modes 1049, 2004, and 25 select the alternate screen,
 // bracketed paste, and cursor visibility respectively.
 const ENTER_TERMINAL_SCREEN: &[u8] = b"\x1b[?1049h\x1b[?2004h\x1b[?25l";
-const LEAVE_TERMINAL_SCREEN: &[u8] = b"\x1b[?25h\x1b[?2004l\x1b[?1049l";
+const LEAVE_TERMINAL_SCREEN: &[u8] = b"\x1b[?25h\x1b[?2004l\x1b[?1049l\x1b[0 q";
 
 /// Darwin `struct termios` from XNU termios.h.
 #[repr(C)]
