@@ -147,7 +147,7 @@ struct InputRecord {
 
 // Win32 declarations from winbase.h and wincon.h. `link_name` keeps Rust names
 // idiomatic while binding the exact exported symbols.
-#[link(name = "Kernel32")]
+#[link(name = "kernel32")]
 unsafe extern "system" {
     #[link_name = "GetStdHandle"]
     fn get_std_handle(standard_handle: Dword) -> Handle;
@@ -172,6 +172,13 @@ pub(super) struct PlatformTerminal {
     original_input_mode: Dword,
     original_output_mode: Dword,
     stdout: io::Stdout,
+    repeated_key: Option<(Key, Word)>,
+    high_surrogate: Option<u16>,
+}
+
+pub(super) struct PlatformTerminalReader {
+    input: usize,
+    output: usize,
     repeated_key: Option<(Key, Word)>,
     high_surrogate: Option<u16>,
 }
@@ -215,56 +222,19 @@ impl PlatformTerminal {
     }
 
     pub(super) fn size(&self) -> Result<TerminalSize> {
-        let mut info = MaybeUninit::<ConsoleScreenBufferInfo>::uninit();
-        // SAFETY: `self.output` is a validated console handle and `info` points
-        // to writable storage with the documented Win32 structure layout.
-        let success = unsafe { get_console_screen_buffer_info(self.output, info.as_mut_ptr()) };
-        ensure!(
-            success != 0,
-            "failed to read terminal size: {}",
-            io::Error::last_os_error()
-        );
-        // SAFETY: successful GetConsoleScreenBufferInfo initialized `info`.
-        let window = unsafe { info.assume_init() }.window;
-        let columns = i32::from(window.right) - i32::from(window.left) + 1;
-        let rows = i32::from(window.bottom) - i32::from(window.top) + 1;
-        ensure!(rows > 0 && columns > 0, "terminal size is zero");
-        Ok(TerminalSize {
-            rows: rows as usize,
-            columns: columns as usize,
-        })
+        get_terminal_size(self.output)
     }
 
     pub(super) fn read_key(&mut self) -> Result<Key> {
-        if let Some((key, remaining)) = self.repeated_key.take() {
-            if remaining > 1 {
-                self.repeated_key = Some((key.clone(), remaining - 1));
-            }
-            return Ok(key);
-        }
+        read_key(self.input, &mut self.repeated_key, &mut self.high_surrogate)
+    }
 
-        loop {
-            let record = self.read_input_record()?;
-            match record.event_type {
-                WINDOW_BUFFER_SIZE_EVENT => return Ok(Key::Resize),
-                KEY_EVENT => {
-                    // SAFETY: INPUT_RECORD's event tag identifies the active
-                    // union member as KEY_EVENT_RECORD.
-                    let event = unsafe { record.event.key };
-                    if event.key_down == 0 {
-                        continue;
-                    }
-                    if let Some(key) = translate_key(event, &mut self.high_surrogate) {
-                        // ReadConsoleInputW coalesces held keys in repeat_count;
-                        // preserve that behavior as individual editor events.
-                        if event.repeat_count > 1 {
-                            self.repeated_key = Some((key.clone(), event.repeat_count - 1));
-                        }
-                        return Ok(key);
-                    }
-                }
-                _ => {}
-            }
+    pub(super) fn input_reader(&self) -> PlatformTerminalReader {
+        PlatformTerminalReader {
+            input: self.input as usize,
+            output: self.output as usize,
+            repeated_key: None,
+            high_surrogate: None,
         }
     }
 
@@ -276,23 +246,94 @@ impl PlatformTerminal {
             .flush()
             .context("failed to flush terminal output")
     }
+}
 
-    fn read_input_record(&self) -> Result<InputRecord> {
-        let mut record = MaybeUninit::<InputRecord>::uninit();
-        let mut records_read = 0;
-        // SAFETY: `self.input` is a validated console handle. The record and
-        // count pointers are writable for the one requested input record.
-        let success =
-            unsafe { read_console_input(self.input, record.as_mut_ptr(), 1, &mut records_read) };
-        ensure!(
-            success != 0,
-            "failed to read terminal input: {}",
-            io::Error::last_os_error()
-        );
-        ensure!(records_read == 1, "terminal input returned no records");
-        // SAFETY: ReadConsoleInputW reported that it initialized one record.
-        Ok(unsafe { record.assume_init() })
+impl PlatformTerminalReader {
+    pub(super) fn size(&self) -> Result<TerminalSize> {
+        get_terminal_size(self.output as Handle)
     }
+
+    pub(super) fn read_key(&mut self) -> Result<Key> {
+        read_key(
+            self.input as Handle,
+            &mut self.repeated_key,
+            &mut self.high_surrogate,
+        )
+    }
+}
+
+fn read_key(
+    input: Handle,
+    repeated_key: &mut Option<(Key, Word)>,
+    high_surrogate: &mut Option<u16>,
+) -> Result<Key> {
+    if let Some((key, remaining)) = repeated_key.take() {
+        if remaining > 1 {
+            *repeated_key = Some((key.clone(), remaining - 1));
+        }
+        return Ok(key);
+    }
+
+    loop {
+        let record = read_input_record(input)?;
+        match record.event_type {
+            WINDOW_BUFFER_SIZE_EVENT => return Ok(Key::Resize),
+            KEY_EVENT => {
+                // SAFETY: INPUT_RECORD's event tag identifies the active
+                // union member as KEY_EVENT_RECORD.
+                let event = unsafe { record.event.key };
+                if event.key_down == 0 {
+                    continue;
+                }
+                if let Some(key) = translate_key(event, high_surrogate) {
+                    // ReadConsoleInputW coalesces held keys in repeat_count;
+                    // preserve that behavior as individual editor events.
+                    if event.repeat_count > 1 {
+                        *repeated_key = Some((key.clone(), event.repeat_count - 1));
+                    }
+                    return Ok(key);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn read_input_record(input: Handle) -> Result<InputRecord> {
+    let mut record = MaybeUninit::<InputRecord>::uninit();
+    let mut records_read = 0;
+    // SAFETY: `self.input` is a validated console handle. The record and
+    // count pointers are writable for the one requested input record.
+    let success = unsafe { read_console_input(input, record.as_mut_ptr(), 1, &mut records_read) };
+    ensure!(
+        success != 0,
+        "failed to read terminal input: {}",
+        io::Error::last_os_error()
+    );
+    ensure!(records_read == 1, "terminal input returned no records");
+    // SAFETY: ReadConsoleInputW reported that it initialized one record.
+    Ok(unsafe { record.assume_init() })
+}
+
+fn get_terminal_size(output: Handle) -> Result<TerminalSize> {
+    let mut info = MaybeUninit::<ConsoleScreenBufferInfo>::uninit();
+    // SAFETY: `output` is a validated console handle and `info` points to
+    // writable storage with the documented Win32 structure layout.
+    let success = unsafe { get_console_screen_buffer_info(output, info.as_mut_ptr()) };
+    ensure!(
+        success != 0,
+        "failed to read terminal size: {}",
+        io::Error::last_os_error()
+    );
+    // SAFETY: successful GetConsoleScreenBufferInfo initialized `info`.
+    let window = unsafe { info.assume_init() }.window;
+    let columns = i32::from(window.right) - i32::from(window.left) + 1;
+    let rows = i32::from(window.bottom) - i32::from(window.top) + 1;
+    ensure!(rows > 0 && columns > 0, "terminal size is zero");
+    Ok(TerminalSize {
+        rows: rows as usize,
+        columns: columns as usize,
+    })
 }
 
 impl Drop for PlatformTerminal {

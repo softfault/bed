@@ -97,6 +97,12 @@ pub(super) struct PlatformTerminal {
     last_size: Cell<TerminalSize>,
 }
 
+pub(super) struct PlatformTerminalReader {
+    input: VtInput<io::Stdin>,
+    output_fd: c_int,
+    last_size: Cell<TerminalSize>,
+}
+
 impl PlatformTerminal {
     pub(super) fn new() -> Result<Self> {
         let input = io::stdin();
@@ -139,15 +145,14 @@ impl PlatformTerminal {
     }
 
     pub(super) fn read_key(&mut self) -> Result<Key> {
-        loop {
-            if let Some(key) = self.input.read_key()? {
-                return Ok(key);
-            }
-            // A zero-byte read is the VTIME timeout configured in new().
-            let size = get_window_size(self.output_fd)?;
-            if size != self.last_size.replace(size) {
-                return Ok(Key::Resize);
-            }
+        read_key(&mut self.input, self.output_fd, &self.last_size)
+    }
+
+    pub(super) fn input_reader(&self) -> PlatformTerminalReader {
+        PlatformTerminalReader {
+            input: VtInput::new(io::stdin()),
+            output_fd: self.output_fd,
+            last_size: Cell::new(self.last_size.get()),
         }
     }
 
@@ -158,6 +163,35 @@ impl PlatformTerminal {
         self.output
             .flush()
             .context("failed to flush terminal output")
+    }
+}
+
+impl PlatformTerminalReader {
+    pub(super) fn size(&self) -> Result<TerminalSize> {
+        let size = get_window_size(self.output_fd)?;
+        self.last_size.set(size);
+        Ok(size)
+    }
+
+    pub(super) fn read_key(&mut self) -> Result<Key> {
+        read_key(&mut self.input, self.output_fd, &self.last_size)
+    }
+}
+
+fn read_key(
+    input: &mut VtInput<io::Stdin>,
+    output_fd: c_int,
+    last_size: &Cell<TerminalSize>,
+) -> Result<Key> {
+    loop {
+        if let Some(key) = input.read_key()? {
+            return Ok(key);
+        }
+        // A zero-byte read is the VTIME timeout configured in new().
+        let size = get_window_size(output_fd)?;
+        if size != last_size.replace(size) {
+            return Ok(Key::Resize);
+        }
     }
 }
 

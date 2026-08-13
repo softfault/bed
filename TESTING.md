@@ -16,7 +16,8 @@ cargo build --workspace --release --locked
 On Linux, macOS, FreeBSD, and NetBSD, `cargo test` includes a native
 pseudoterminal test for bed's outer terminal. It covers raw-mode entry, idle
 resize detection, UTF-8 input and saving, normal restoration, default
-cursor-shape restoration, and restoration during panic unwinding.
+cursor-shape restoration, sized resize events, and restoration during panic
+unwinding.
 
 Linux also runs `bed-pty` against a real child pseudoterminal. Those tests cover
 I/O, resize, terminal environment selection, exit status, explicit process-group

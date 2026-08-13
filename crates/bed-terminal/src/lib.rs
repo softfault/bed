@@ -8,6 +8,13 @@
 #![deny(clippy::undocumented_unsafe_blocks)]
 
 use anyhow::Result;
+use std::{
+    sync::mpsc::{self, Receiver, RecvTimeoutError},
+    thread::{self, JoinHandle},
+    time::Duration,
+};
+
+const EVENT_QUEUE_CAPACITY: usize = 256;
 
 mod child;
 
@@ -123,12 +130,26 @@ pub struct TerminalSize {
 
 pub struct Terminal {
     platform: platform::PlatformTerminal,
+    input_claimed: bool,
+}
+
+/// Bounded host-terminal input delivery for an application event loop.
+pub struct TerminalEvents {
+    receiver: Receiver<Result<TerminalEvent>>,
+    _thread: JoinHandle<()>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalEvent {
+    Key(Key),
+    Resize(TerminalSize),
 }
 
 impl Terminal {
     pub fn new() -> Result<Self> {
         Ok(Self {
             platform: platform::PlatformTerminal::new()?,
+            input_claimed: false,
         })
     }
 
@@ -137,10 +158,146 @@ impl Terminal {
     }
 
     pub fn read_key(&mut self) -> Result<Key> {
+        anyhow::ensure!(
+            !self.input_claimed,
+            "host terminal input is owned by the event thread"
+        );
         self.platform.read_key()
+    }
+
+    pub fn events(&mut self) -> Result<TerminalEvents> {
+        anyhow::ensure!(
+            !self.input_claimed,
+            "host terminal input is already claimed"
+        );
+        let mut reader = self.platform.input_reader();
+        let (sender, receiver) = mpsc::sync_channel(EVENT_QUEUE_CAPACITY);
+        let input_thread = thread::Builder::new()
+            .name("bed-terminal-input".to_owned())
+            .spawn(move || {
+                loop {
+                    let event = reader
+                        .read_key()
+                        .and_then(|key| classify_event(key, || reader.size()));
+                    let failed = event.is_err();
+                    if sender.send(event).is_err() || failed {
+                        break;
+                    }
+                }
+            })?;
+        self.input_claimed = true;
+        Ok(TerminalEvents {
+            receiver,
+            _thread: input_thread,
+        })
     }
 
     pub fn draw(&mut self, bytes: &[u8]) -> Result<()> {
         self.platform.draw(bytes)
+    }
+}
+
+impl TerminalEvents {
+    /// Waits for one event, then drains a bounded batch without blocking.
+    ///
+    /// An empty batch means the timeout elapsed. This lets the application
+    /// advance child terminal sessions even when the user provides no input.
+    pub fn next_batch(&self, timeout: Duration) -> Result<Vec<TerminalEvent>> {
+        let first = match self.receiver.recv_timeout(timeout) {
+            Ok(event) => event?,
+            Err(RecvTimeoutError::Timeout) => return Ok(Vec::new()),
+            Err(RecvTimeoutError::Disconnected) => {
+                anyhow::bail!("host terminal input thread stopped")
+            }
+        };
+        let mut events = vec![first];
+        for event in self.receiver.try_iter().take(EVENT_QUEUE_CAPACITY - 1) {
+            events.push(event?);
+        }
+        Ok(events)
+    }
+}
+
+fn classify_event(key: Key, size: impl FnOnce() -> Result<TerminalSize>) -> Result<TerminalEvent> {
+    if key == Key::Resize {
+        return size().map(TerminalEvent::Resize);
+    }
+    Ok(TerminalEvent::Key(key))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Key, TerminalEvent, TerminalEvents, TerminalSize, classify_event};
+    use anyhow::Result;
+    use std::{
+        cell::Cell,
+        sync::mpsc,
+        thread,
+        time::{Duration, Instant},
+    };
+
+    #[test]
+    fn turns_resize_keys_into_sized_events() -> Result<()> {
+        let queried = Cell::new(false);
+        let key = classify_event(Key::BackTab, || {
+            queried.set(true);
+            Ok(TerminalSize {
+                rows: 20,
+                columns: 80,
+            })
+        })?;
+        assert_eq!(key, TerminalEvent::Key(Key::BackTab));
+        assert!(!queried.get());
+
+        let resize = classify_event(Key::Resize, || {
+            queried.set(true);
+            Ok(TerminalSize {
+                rows: 40,
+                columns: 120,
+            })
+        })?;
+        assert_eq!(
+            resize,
+            TerminalEvent::Resize(TerminalSize {
+                rows: 40,
+                columns: 120
+            })
+        );
+        assert!(queried.get());
+        Ok(())
+    }
+
+    #[test]
+    fn batches_ready_events_and_times_out_when_idle() -> Result<()> {
+        let (sender, receiver) = mpsc::sync_channel(4);
+        sender.send(Ok(TerminalEvent::Key(Key::Char('a'))))?;
+        sender.send(Ok(TerminalEvent::Key(Key::Char('b'))))?;
+        let events = TerminalEvents {
+            receiver,
+            _thread: thread::spawn(move || {
+                thread::sleep(Duration::from_millis(100));
+                drop(sender);
+            }),
+        };
+
+        assert_eq!(
+            events.next_batch(Duration::from_secs(1))?,
+            [
+                TerminalEvent::Key(Key::Char('a')),
+                TerminalEvent::Key(Key::Char('b'))
+            ]
+        );
+        let started = Instant::now();
+        assert!(events.next_batch(Duration::from_millis(10))?.is_empty());
+        assert!(started.elapsed() >= Duration::from_millis(5));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(
+            events
+                .next_batch(Duration::from_secs(1))
+                .unwrap_err()
+                .to_string()
+                .contains("input thread stopped")
+        );
+        Ok(())
     }
 }

@@ -2,19 +2,29 @@
 
 use anyhow::Result;
 use bed_core::{Document, Editor};
-use bed_terminal::Terminal;
+use bed_terminal::{Terminal, TerminalEvent};
 use bed_tui::App;
-use std::{env, ffi::OsString, path::PathBuf};
+use std::{env, ffi::OsString, path::PathBuf, time::Duration};
 
 fn main() -> Result<()> {
     let paths = parse_paths(env::args_os().skip(1))?;
     let mut app = open_app(paths)?;
     let mut terminal = Terminal::new()?;
+    let mut size = terminal.size()?;
+    let events = terminal.events()?;
 
     while !app.should_quit() {
-        let frame = app.render(terminal.size()?);
+        let frame = app.render(size);
         terminal.draw(&frame)?;
-        app.handle_key(terminal.read_key()?)?;
+        for event in events.next_batch(Duration::from_millis(100))? {
+            if app.should_quit() {
+                break;
+            }
+            match event {
+                TerminalEvent::Key(key) => app.handle_key(key)?,
+                TerminalEvent::Resize(resized) => size = resized,
+            }
+        }
     }
     Ok(())
 }

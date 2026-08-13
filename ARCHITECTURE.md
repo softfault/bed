@@ -29,10 +29,17 @@ The terminal boundary is deliberately small:
 Terminal::new() -> Result<Terminal>
 Terminal::size(&self) -> Result<TerminalSize>
 Terminal::read_key(&mut self) -> Result<Key>
+Terminal::events(&mut self) -> Result<TerminalEvents>
 Terminal::draw(&mut self, bytes: &[u8]) -> Result<()>
 ```
 
 Backends are selected at compile time. There is no dynamic backend trait or platform state in the editor core.
+
+The application claims host input through `Terminal::events` and receives
+bounded batches of key and sized-resize events. Timeout batches provide a
+portable wakeup for polling child sessions when no key is pressed. Synchronous
+`read_key` remains for narrow terminal tests, but cannot be used after input
+has been claimed by the event thread.
 
 ## Editing state
 
