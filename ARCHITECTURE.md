@@ -4,7 +4,7 @@
 
 ## Layers
 
-The workspace is split into five packages:
+The workspace is split into six packages:
 
 | Package | Responsibility | Internal dependencies |
 | --- | --- | --- |
@@ -12,6 +12,7 @@ The workspace is split into five packages:
 | `bed-file` | Recoverable file replacement and its narrow native boundary | None |
 | `bed-terminal` | Semantic input types and native terminal backends | None |
 | `bed-tui` | Modes, commands, layout, and frame rendering | `bed-core`, `bed-terminal` |
+| `bed-vt100` | Incremental VT parsing, screen state, modes, and scrollback | None |
 | `bed` | Argument parsing and the main event loop | All three libraries |
 
 `bed-core`, `bed-tui`, and the `bed` binary forbid unsafe code. Native ABI calls are confined to `bed-terminal` and the Windows replacement operation in `bed-file`; both deny unsafe operations outside explicit unsafe blocks.
@@ -71,6 +72,12 @@ The TUI uses a block cursor for Normal, Visual, command, search, and tree
 modes, and a bar cursor for Insert mode. Every terminal backend restores the
 terminal-selected default cursor shape when bed exits, including panic
 unwinding on native backends that support it.
+
+The embedded terminal planned for 0.4.0 uses `bed-vt100`, an independently
+written terminal emulator maintained in this workspace. Terminal-emulation
+state remains separate from the native PTY/ConPTY process boundary and from UI
+placement. Its compatibility scope and release gates are defined in
+[`docs/terminal-emulator.md`](docs/terminal-emulator.md).
 
 ## Supported targets
 
