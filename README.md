@@ -72,6 +72,7 @@ buffer.
 Terminal Input mode:
 
 - Keys and bracketed paste are sent to the child session.
+- Mouse input over the focused live terminal is sent when the child enables mouse reporting.
 - `Ctrl-\ Ctrl-N`: enter Terminal Normal mode.
 - `Ctrl-\ Ctrl-W`: apply one bed window command.
 - `Ctrl-\ Ctrl-\`: send a literal `Ctrl-\` to the child.

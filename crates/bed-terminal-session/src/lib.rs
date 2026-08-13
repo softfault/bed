@@ -8,7 +8,7 @@
 use anyhow::{Context, Result, bail};
 use bed_pty::PtyProcess;
 pub use bed_pty::PtySize;
-use bed_terminal::{Key, encode_child_key};
+use bed_terminal::{Key, MouseEvent, encode_child_key, encode_child_mouse};
 use bed_vt100::{Screen, TerminalEmulator, TerminalModes};
 use std::{
     collections::HashMap,
@@ -196,6 +196,14 @@ impl TerminalSession {
 
     pub fn send_key(&self, key: &Key) -> Result<()> {
         let bytes = encode_child_key(key, self.terminal.modes());
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        self.send_bytes(bytes)
+    }
+
+    pub fn send_mouse(&self, event: MouseEvent) -> Result<()> {
+        let bytes = encode_child_mouse(event, self.terminal.modes());
         if bytes.is_empty() {
             return Ok(());
         }

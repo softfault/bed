@@ -16,7 +16,9 @@
 //!   and [virtual-key codes](https://learn.microsoft.com/en-us/windows/win32/inputdev/virtual-key-codes)
 //! - xterm [`ctlseqs`](https://invisible-island.net/xterm/ctlseqs/ctlseqs.html)
 
-use super::{Key, Modifiers, SpecialKey, TerminalSize};
+use super::{
+    HostInput, Key, Modifiers, MouseAction, MouseButton, MouseEvent, SpecialKey, TerminalSize,
+};
 use anyhow::{Context, Result, ensure};
 use std::{
     ffi::c_void,
@@ -41,6 +43,7 @@ const ENABLE_PROCESSED_INPUT: Dword = 0x0001;
 const ENABLE_LINE_INPUT: Dword = 0x0002;
 const ENABLE_ECHO_INPUT: Dword = 0x0004;
 const ENABLE_WINDOW_INPUT: Dword = 0x0008;
+const ENABLE_MOUSE_INPUT: Dword = 0x0010;
 const ENABLE_QUICK_EDIT_MODE: Dword = 0x0040;
 const ENABLE_EXTENDED_FLAGS: Dword = 0x0080;
 const ENABLE_VIRTUAL_TERMINAL_PROCESSING: Dword = 0x0004;
@@ -48,7 +51,15 @@ const DISABLE_NEWLINE_AUTO_RETURN: Dword = 0x0008;
 
 // INPUT_RECORD event tags from wincon.h.
 const KEY_EVENT: Word = 0x0001;
+const MOUSE_EVENT: Word = 0x0002;
 const WINDOW_BUFFER_SIZE_EVENT: Word = 0x0004;
+
+const FROM_LEFT_1ST_BUTTON_PRESSED: Dword = 0x0001;
+const RIGHTMOST_BUTTON_PRESSED: Dword = 0x0002;
+const FROM_LEFT_2ND_BUTTON_PRESSED: Dword = 0x0004;
+const MOUSE_MOVED: Dword = 0x0001;
+const MOUSE_WHEELED: Dword = 0x0004;
+const MOUSE_HWHEELED: Dword = 0x0008;
 
 // KEY_EVENT_RECORD control-key-state flags from wincon.h.
 const RIGHT_ALT_PRESSED: Dword = 0x0001;
@@ -127,12 +138,22 @@ struct WindowBufferSizeRecord {
     size: Coord,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MouseEventRecord {
+    position: Coord,
+    button_state: Dword,
+    control_key_state: Dword,
+    event_flags: Dword,
+}
+
 /// The largest members of Win32 `INPUT_RECORD.Event` are 16 bytes.
 #[repr(C)]
 #[derive(Clone, Copy)]
 #[allow(dead_code)]
 union InputEvent {
     key: KeyEventRecord,
+    mouse: MouseEventRecord,
     window_size: WindowBufferSizeRecord,
     padding: [Dword; 4],
 }
@@ -181,6 +202,7 @@ pub(super) struct PlatformTerminalReader {
     output: usize,
     repeated_key: Option<(Key, Word)>,
     high_surrogate: Option<u16>,
+    mouse_buttons: Dword,
 }
 
 impl PlatformTerminal {
@@ -196,6 +218,7 @@ impl PlatformTerminal {
                 | ENABLE_ECHO_INPUT
                 | ENABLE_QUICK_EDIT_MODE))
             | ENABLE_WINDOW_INPUT
+            | ENABLE_MOUSE_INPUT
             | ENABLE_EXTENDED_FLAGS;
         set_console_mode(input, input_mode, "standard input")?;
 
@@ -235,6 +258,7 @@ impl PlatformTerminal {
             output: self.output as usize,
             repeated_key: None,
             high_surrogate: None,
+            mouse_buttons: 0,
         }
     }
 
@@ -253,11 +277,13 @@ impl PlatformTerminalReader {
         get_terminal_size(self.output as Handle)
     }
 
-    pub(super) fn read_key(&mut self) -> Result<Key> {
-        read_key(
+    pub(super) fn read_event(&mut self) -> Result<HostInput> {
+        read_event(
             self.input as Handle,
+            self.output as Handle,
             &mut self.repeated_key,
             &mut self.high_surrogate,
+            &mut self.mouse_buttons,
         )
     }
 }
@@ -267,17 +293,39 @@ fn read_key(
     repeated_key: &mut Option<(Key, Word)>,
     high_surrogate: &mut Option<u16>,
 ) -> Result<Key> {
+    let output = get_standard_handle(STD_OUTPUT_HANDLE)?;
+    let mut mouse_buttons = 0;
+    loop {
+        if let HostInput::Key(key) = read_event(
+            input,
+            output,
+            repeated_key,
+            high_surrogate,
+            &mut mouse_buttons,
+        )? {
+            return Ok(key);
+        }
+    }
+}
+
+fn read_event(
+    input: Handle,
+    output: Handle,
+    repeated_key: &mut Option<(Key, Word)>,
+    high_surrogate: &mut Option<u16>,
+    mouse_buttons: &mut Dword,
+) -> Result<HostInput> {
     if let Some((key, remaining)) = repeated_key.take() {
         if remaining > 1 {
             *repeated_key = Some((key.clone(), remaining - 1));
         }
-        return Ok(key);
+        return Ok(HostInput::Key(key));
     }
 
     loop {
         let record = read_input_record(input)?;
         match record.event_type {
-            WINDOW_BUFFER_SIZE_EVENT => return Ok(Key::Resize),
+            WINDOW_BUFFER_SIZE_EVENT => return Ok(HostInput::Key(Key::Resize)),
             KEY_EVENT => {
                 // SAFETY: INPUT_RECORD's event tag identifies the active
                 // union member as KEY_EVENT_RECORD.
@@ -291,11 +339,83 @@ fn read_key(
                     if event.repeat_count > 1 {
                         *repeated_key = Some((key.clone(), event.repeat_count - 1));
                     }
-                    return Ok(key);
+                    return Ok(HostInput::Key(key));
+                }
+            }
+            MOUSE_EVENT => {
+                // SAFETY: INPUT_RECORD's event tag identifies the active
+                // union member as MOUSE_EVENT_RECORD.
+                let event = unsafe { record.event.mouse };
+                if let Some(mouse) = translate_mouse(event, mouse_buttons, terminal_origin(output)?)
+                {
+                    return Ok(HostInput::Mouse(mouse));
                 }
             }
             _ => {}
         }
+    }
+}
+
+fn translate_mouse(
+    event: MouseEventRecord,
+    previous_buttons: &mut Dword,
+    origin: Coord,
+) -> Option<MouseEvent> {
+    if event.event_flags & MOUSE_HWHEELED != 0 {
+        return None;
+    }
+    let row = usize::try_from(i32::from(event.position.y) - i32::from(origin.y)).ok()?;
+    let column = usize::try_from(i32::from(event.position.x) - i32::from(origin.x)).ok()?;
+    let modifiers = decode_modifiers(event.control_key_state);
+    let action = if event.event_flags & MOUSE_WHEELED != 0 {
+        if (event.button_state >> 16) as i16 > 0 {
+            MouseAction::ScrollUp
+        } else {
+            MouseAction::ScrollDown
+        }
+    } else {
+        let changed = *previous_buttons ^ event.button_state;
+        let button = changed_button(changed).or_else(|| changed_button(event.button_state));
+        let action = if event.event_flags & MOUSE_MOVED != 0 {
+            button.map_or(MouseAction::Move, MouseAction::Drag)
+        } else if let Some(button) = changed_button(changed) {
+            if event.button_state & button_mask(button) != 0 {
+                MouseAction::Press(button)
+            } else {
+                MouseAction::Release(button)
+            }
+        } else {
+            *previous_buttons = event.button_state;
+            return None;
+        };
+        *previous_buttons = event.button_state;
+        action
+    };
+    Some(MouseEvent {
+        row,
+        column,
+        action,
+        modifiers,
+    })
+}
+
+fn changed_button(state: Dword) -> Option<MouseButton> {
+    if state & FROM_LEFT_1ST_BUTTON_PRESSED != 0 {
+        Some(MouseButton::Left)
+    } else if state & FROM_LEFT_2ND_BUTTON_PRESSED != 0 {
+        Some(MouseButton::Middle)
+    } else if state & RIGHTMOST_BUTTON_PRESSED != 0 {
+        Some(MouseButton::Right)
+    } else {
+        None
+    }
+}
+
+fn button_mask(button: MouseButton) -> Dword {
+    match button {
+        MouseButton::Left => FROM_LEFT_1ST_BUTTON_PRESSED,
+        MouseButton::Middle => FROM_LEFT_2ND_BUTTON_PRESSED,
+        MouseButton::Right => RIGHTMOST_BUTTON_PRESSED,
     }
 }
 
@@ -333,6 +453,24 @@ fn get_terminal_size(output: Handle) -> Result<TerminalSize> {
     Ok(TerminalSize {
         rows: rows as usize,
         columns: columns as usize,
+    })
+}
+
+fn terminal_origin(output: Handle) -> Result<Coord> {
+    let mut info = MaybeUninit::<ConsoleScreenBufferInfo>::uninit();
+    // SAFETY: `output` is a validated console handle and `info` points to
+    // writable storage with the documented Win32 structure layout.
+    let success = unsafe { get_console_screen_buffer_info(output, info.as_mut_ptr()) };
+    ensure!(
+        success != 0,
+        "failed to read terminal position: {}",
+        io::Error::last_os_error()
+    );
+    // SAFETY: successful GetConsoleScreenBufferInfo initialized `info`.
+    let window = unsafe { info.assume_init() }.window;
+    Ok(Coord {
+        x: window.left,
+        y: window.top,
     })
 }
 
@@ -469,14 +607,16 @@ const _: () = {
     assert!(size_of::<Coord>() == 4);
     assert!(size_of::<ConsoleScreenBufferInfo>() == 22);
     assert!(size_of::<KeyEventRecord>() == 16);
+    assert!(size_of::<MouseEventRecord>() == 16);
     assert!(size_of::<InputRecord>() == 20);
 };
 
 #[cfg(test)]
 mod tests {
     use super::{
-        Key, KeyEventRecord, LEFT_CTRL_PRESSED, Modifiers, SHIFT_PRESSED, SpecialKey, VK_LEFT,
-        VK_TAB, translate_key,
+        Coord, FROM_LEFT_1ST_BUTTON_PRESSED, Key, KeyEventRecord, LEFT_CTRL_PRESSED, MOUSE_MOVED,
+        MOUSE_WHEELED, Modifiers, MouseAction, MouseButton, MouseEvent, MouseEventRecord,
+        SHIFT_PRESSED, SpecialKey, VK_LEFT, VK_TAB, translate_key, translate_mouse,
     };
 
     fn event(virtual_key_code: u16, unicode_char: u16, control_key_state: u32) -> KeyEventRecord {
@@ -533,6 +673,73 @@ mod tests {
         assert_eq!(
             translate_key(event(0, 0xde00, 0), &mut surrogate),
             Some(Key::Char('😀'))
+        );
+    }
+
+    #[test]
+    fn translates_mouse_coordinates_buttons_and_motion() {
+        let origin = Coord { x: 10, y: 20 };
+        let mut buttons = 0;
+        let press = MouseEventRecord {
+            position: Coord { x: 14, y: 22 },
+            button_state: FROM_LEFT_1ST_BUTTON_PRESSED,
+            control_key_state: SHIFT_PRESSED,
+            event_flags: 0,
+        };
+        assert_eq!(
+            translate_mouse(press, &mut buttons, origin),
+            Some(MouseEvent {
+                row: 2,
+                column: 4,
+                action: MouseAction::Press(MouseButton::Left),
+                modifiers: Modifiers {
+                    shift: true,
+                    ..Modifiers::default()
+                },
+            })
+        );
+        assert_eq!(buttons, FROM_LEFT_1ST_BUTTON_PRESSED);
+
+        let drag = MouseEventRecord {
+            position: Coord { x: 15, y: 23 },
+            event_flags: MOUSE_MOVED,
+            ..press
+        };
+        assert_eq!(
+            translate_mouse(drag, &mut buttons, origin).map(|mouse| mouse.action),
+            Some(MouseAction::Drag(MouseButton::Left))
+        );
+
+        let release = MouseEventRecord {
+            position: Coord { x: 15, y: 23 },
+            button_state: 0,
+            control_key_state: 0,
+            event_flags: 0,
+        };
+        assert_eq!(
+            translate_mouse(release, &mut buttons, origin).map(|mouse| mouse.action),
+            Some(MouseAction::Release(MouseButton::Left))
+        );
+        assert_eq!(buttons, 0);
+    }
+
+    #[test]
+    fn translates_vertical_wheel_direction() {
+        let origin = Coord { x: 0, y: 0 };
+        let mut buttons = 0;
+        let wheel = |delta: i16| MouseEventRecord {
+            position: origin,
+            button_state: u32::from(delta as u16) << 16,
+            control_key_state: 0,
+            event_flags: MOUSE_WHEELED,
+        };
+        assert_eq!(
+            translate_mouse(wheel(120), &mut buttons, origin).map(|mouse| mouse.action),
+            Some(MouseAction::ScrollUp)
+        );
+        assert_eq!(
+            translate_mouse(wheel(-120), &mut buttons, origin).map(|mouse| mouse.action),
+            Some(MouseAction::ScrollDown)
         );
     }
 }

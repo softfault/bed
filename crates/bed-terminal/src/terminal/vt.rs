@@ -10,13 +10,13 @@
 //! - xterm [`ctlseqs`](https://invisible-island.net/xterm/ctlseqs/ctlseqs.html),
 //!   especially “PC-Style Function Keys”
 
-use super::{Key, Modifiers, SpecialKey};
+use super::{HostInput, Key, Modifiers, MouseAction, MouseButton, MouseEvent, SpecialKey};
 use anyhow::{Context, Result};
 use std::io::Read;
 
 // A fixed parser bound prevents an unterminated or hostile sequence from
 // growing memory. Supported navigation sequences are much shorter than this.
-const MAX_ESCAPE_SEQUENCE: usize = 16;
+const MAX_ESCAPE_SEQUENCE: usize = 64;
 // Paste input is delivered as one editor event. Bound it independently from
 // navigation sequences, while still consuming an oversized paste terminator.
 const MAX_PASTE_BYTES: usize = 16 * 1024 * 1024;
@@ -37,35 +37,45 @@ impl<R: Read> VtInput<R> {
     }
 
     pub(super) fn read_key(&mut self) -> Result<Option<Key>> {
+        loop {
+            match self.read_event()? {
+                Some(HostInput::Key(key)) => return Ok(Some(key)),
+                Some(HostInput::Mouse(_)) => {}
+                None => return Ok(None),
+            }
+        }
+    }
+
+    pub(super) fn read_event(&mut self) -> Result<Option<HostInput>> {
         let Some(byte) = self.read_byte()? else {
             return Ok(None);
         };
 
-        let key = match byte {
+        let event = match byte {
             b'\r' | b'\n' => Key::Enter,
             b'\t' => Key::Tab,
             8 | 127 => Key::Backspace,
             1..=26 => Key::Ctrl(char::from(byte + b'a' - 1)),
             0x1c..=0x1f => Key::Ctrl(char::from(byte + b'@')),
-            b'\x1b' => self.read_escape_sequence()?,
+            b'\x1b' => return self.read_escape_sequence().map(Some),
             32..=126 => Key::Char(char::from(byte)),
             128..=255 => self.read_utf8_character(byte)?,
             _ => Key::Unknown,
         };
-        Ok(Some(key))
+        Ok(Some(HostInput::Key(event)))
     }
 
-    fn read_escape_sequence(&mut self) -> Result<Key> {
+    fn read_escape_sequence(&mut self) -> Result<HostInput> {
         let Some(first) = self.read_byte()? else {
             // On POSIX backends this is the VTIME inter-byte timeout, which
             // distinguishes a standalone Escape from a following sequence.
-            return Ok(Key::Escape);
+            return Ok(HostInput::Key(Key::Escape));
         };
         match first {
             b'[' | b'O' => self.read_csi_sequence(),
             byte => {
                 self.pending_byte = Some(byte);
-                Ok(Key::Escape)
+                Ok(HostInput::Key(Key::Escape))
             }
         }
     }
@@ -91,13 +101,13 @@ impl<R: Read> VtInput<R> {
             .map_or(Key::Unknown, Key::Char))
     }
 
-    fn read_csi_sequence(&mut self) -> Result<Key> {
+    fn read_csi_sequence(&mut self) -> Result<HostInput> {
         let mut sequence = [0; MAX_ESCAPE_SEQUENCE];
         let mut length = 0;
         let mut overflowed = false;
         loop {
             let Some(byte) = self.read_byte()? else {
-                return Ok(Key::Unknown);
+                return Ok(HostInput::Key(Key::Unknown));
             };
             if length < sequence.len() {
                 sequence[length] = byte;
@@ -108,10 +118,10 @@ impl<R: Read> VtInput<R> {
             // ECMA-48 assigns 0x40..=0x7e as CSI final bytes.
             if (0x40..=0x7e).contains(&byte) {
                 if overflowed {
-                    return Ok(Key::Unknown);
+                    return Ok(HostInput::Key(Key::Unknown));
                 }
                 if &sequence[..length] == BRACKETED_PASTE_START {
-                    return self.read_bracketed_paste();
+                    return self.read_bracketed_paste().map(HostInput::Key);
                 }
                 return Ok(parse_csi(&sequence[..length]));
             }
@@ -183,15 +193,19 @@ fn append_paste_bytes(bytes: &mut Vec<u8>, incoming: &[u8], overflowed: &mut boo
     }
 }
 
-fn parse_csi(sequence: &[u8]) -> Key {
+fn parse_csi(sequence: &[u8]) -> HostInput {
     let Some((&final_byte, parameters)) = sequence.split_last() else {
-        return Key::Unknown;
+        return HostInput::Key(Key::Unknown);
     };
+    if matches!(final_byte, b'M' | b'm') && parameters.starts_with(b"<") {
+        return parse_sgr_mouse(&parameters[1..], final_byte)
+            .map_or(HostInput::Key(Key::Unknown), HostInput::Mouse);
+    }
     let Some(parameters) = parse_parameters(parameters) else {
-        return Key::Unknown;
+        return HostInput::Key(Key::Unknown);
     };
 
-    match final_byte {
+    HostInput::Key(match final_byte {
         // Terminals conventionally report Shift-Tab as CSI Z (CBT). Normalize
         // that encoding to the same semantic event as the Windows backend.
         b'Z' if parameters.is_empty() => Key::BackTab,
@@ -212,7 +226,60 @@ fn parse_csi(sequence: &[u8]) -> Key {
             _ => Key::Unknown,
         },
         _ => Key::Unknown,
+    })
+}
+
+fn parse_sgr_mouse(parameters: &[u8], final_byte: u8) -> Option<MouseEvent> {
+    let values = parse_parameters(parameters)?;
+    let [code, column, row] = values.as_slice() else {
+        return None;
+    };
+    let row = row.checked_sub(1)?;
+    let column = column.checked_sub(1)?;
+    let modifiers = Modifiers {
+        shift: code & 4 != 0,
+        alt: code & 8 != 0,
+        control: code & 16 != 0,
+    };
+    let base = code & !(4 | 8 | 16);
+    if base > 65 {
+        return None;
     }
+    let action = if base & 64 != 0 {
+        match base & 3 {
+            0 => MouseAction::ScrollUp,
+            1 => MouseAction::ScrollDown,
+            _ => return None,
+        }
+    } else {
+        let button = match base & 3 {
+            0 => MouseButton::Left,
+            1 => MouseButton::Middle,
+            2 => MouseButton::Right,
+            3 if base & 32 != 0 => {
+                return Some(MouseEvent {
+                    row,
+                    column,
+                    action: MouseAction::Move,
+                    modifiers,
+                });
+            }
+            _ => return None,
+        };
+        if final_byte == b'm' {
+            MouseAction::Release(button)
+        } else if base & 32 != 0 {
+            MouseAction::Drag(button)
+        } else {
+            MouseAction::Press(button)
+        }
+    };
+    Some(MouseEvent {
+        row,
+        column,
+        action,
+        modifiers,
+    })
 }
 
 fn parse_parameters(bytes: &[u8]) -> Option<Vec<usize>> {
@@ -278,7 +345,10 @@ fn decode_modifiers(parameter: usize) -> Option<Modifiers> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Key, Modifiers, SpecialKey, VtInput, parse_csi};
+    use super::{
+        HostInput, Key, Modifiers, MouseAction, MouseButton, MouseEvent, SpecialKey, VtInput,
+        parse_csi,
+    };
     use std::io::Cursor;
 
     #[test]
@@ -317,52 +387,88 @@ mod tests {
 
     #[test]
     fn parses_plain_navigation_sequences() {
-        assert_eq!(parse_csi(b"Z"), Key::BackTab);
-        assert_eq!(parse_csi(b"A"), Key::ArrowUp);
-        assert_eq!(parse_csi(b"3~"), Key::Delete);
-        assert_eq!(parse_csi(b"F"), Key::End);
-        assert_eq!(parse_csi(b"5~"), Key::PageUp);
-        assert_eq!(parse_csi(b"6~"), Key::PageDown);
+        assert_eq!(parse_csi(b"Z"), HostInput::Key(Key::BackTab));
+        assert_eq!(parse_csi(b"A"), HostInput::Key(Key::ArrowUp));
+        assert_eq!(parse_csi(b"3~"), HostInput::Key(Key::Delete));
+        assert_eq!(parse_csi(b"F"), HostInput::Key(Key::End));
+        assert_eq!(parse_csi(b"5~"), HostInput::Key(Key::PageUp));
+        assert_eq!(parse_csi(b"6~"), HostInput::Key(Key::PageDown));
     }
 
     #[test]
     fn parses_xterm_modifier_parameters() {
         assert_eq!(
             parse_csi(b"1;5D"),
-            Key::Modified(
+            HostInput::Key(Key::Modified(
                 SpecialKey::ArrowLeft,
                 Modifiers {
                     control: true,
                     ..Modifiers::default()
                 }
-            )
+            ))
         );
         assert_eq!(
             parse_csi(b"3;2~"),
-            Key::Modified(
+            HostInput::Key(Key::Modified(
                 SpecialKey::Delete,
                 Modifiers {
                     shift: true,
                     ..Modifiers::default()
                 }
-            )
+            ))
         );
         assert_eq!(
             parse_csi(b"1;3C"),
-            Key::Modified(
+            HostInput::Key(Key::Modified(
                 SpecialKey::ArrowRight,
                 Modifiers {
                     alt: true,
                     ..Modifiers::default()
                 }
-            )
+            ))
         );
     }
 
     #[test]
     fn rejects_unsupported_complete_sequences() {
-        assert_eq!(parse_csi(b"1;2Z"), Key::Unknown);
-        assert_eq!(parse_csi(b"1;9D"), Key::Unknown);
-        assert_eq!(parse_csi(b"?25h"), Key::Unknown);
+        assert_eq!(parse_csi(b"1;2Z"), HostInput::Key(Key::Unknown));
+        assert_eq!(parse_csi(b"1;9D"), HostInput::Key(Key::Unknown));
+        assert_eq!(parse_csi(b"?25h"), HostInput::Key(Key::Unknown));
+    }
+
+    #[test]
+    fn parses_sgr_mouse_events() {
+        assert_eq!(
+            parse_csi(b"<16;5;3M"),
+            HostInput::Mouse(MouseEvent {
+                row: 2,
+                column: 4,
+                action: MouseAction::Press(MouseButton::Left),
+                modifiers: Modifiers {
+                    control: true,
+                    ..Modifiers::default()
+                },
+            })
+        );
+        assert_eq!(
+            parse_csi(b"<32;7;4M"),
+            HostInput::Mouse(MouseEvent {
+                row: 3,
+                column: 6,
+                action: MouseAction::Drag(MouseButton::Left),
+                modifiers: Modifiers::default(),
+            })
+        );
+        assert_eq!(
+            parse_csi(b"<64;2;1M"),
+            HostInput::Mouse(MouseEvent {
+                row: 0,
+                column: 1,
+                action: MouseAction::ScrollUp,
+                modifiers: Modifiers::default(),
+            })
+        );
+        assert_eq!(parse_csi(b"<128;2;1M"), HostInput::Key(Key::Unknown));
+        assert_eq!(parse_csi(b"<0;0;1M"), HostInput::Key(Key::Unknown));
     }
 }

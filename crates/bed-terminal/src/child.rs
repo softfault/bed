@@ -1,6 +1,6 @@
 //! xterm-compatible encoding for input sent to child terminal sessions.
 
-use crate::{Key, Modifiers, SpecialKey};
+use crate::{Key, Modifiers, MouseAction, MouseButton, MouseEvent, SpecialKey};
 use bed_vt100::TerminalModes;
 
 pub fn encode_child_key(key: &Key, modes: TerminalModes) -> Vec<u8> {
@@ -31,6 +31,70 @@ pub fn encode_child_key(key: &Key, modes: TerminalModes) -> Vec<u8> {
         Key::Modified(key, modifiers) => modified_key(*key, *modifiers),
         Key::Escape => vec![0x1b],
         Key::Resize | Key::Unknown => Vec::new(),
+    }
+}
+
+pub fn encode_child_mouse(event: MouseEvent, modes: TerminalModes) -> Vec<u8> {
+    let Some(tracking) = modes.mouse_tracking else {
+        return Vec::new();
+    };
+    if matches!(event.action, MouseAction::Move) && tracking != 1003 {
+        return Vec::new();
+    }
+    if matches!(event.action, MouseAction::Drag(_)) && tracking == 1000 {
+        return Vec::new();
+    }
+
+    let Some(button) = mouse_button_code(event.action) else {
+        return Vec::new();
+    };
+    let modifiers = 4 * usize::from(event.modifiers.shift)
+        + 8 * usize::from(event.modifiers.alt)
+        + 16 * usize::from(event.modifiers.control);
+    let code = button + modifiers;
+    let row = event.row.saturating_add(1);
+    let column = event.column.saturating_add(1);
+    if modes.sgr_mouse {
+        let final_byte = if matches!(event.action, MouseAction::Release(_)) {
+            'm'
+        } else {
+            'M'
+        };
+        return format!("\x1b[<{code};{column};{row}{final_byte}").into_bytes();
+    }
+
+    let legacy_code = if matches!(event.action, MouseAction::Release(_)) {
+        3 + modifiers
+    } else {
+        code
+    };
+    let (Ok(code), Ok(column), Ok(row)) = (
+        u8::try_from(legacy_code.saturating_add(32)),
+        u8::try_from(column.saturating_add(32)),
+        u8::try_from(row.saturating_add(32)),
+    ) else {
+        return Vec::new();
+    };
+    vec![0x1b, b'[', b'M', code, column, row]
+}
+
+fn mouse_button_code(action: MouseAction) -> Option<usize> {
+    match action {
+        MouseAction::Press(button) | MouseAction::Release(button) => Some(match button {
+            MouseButton::Left => 0,
+            MouseButton::Middle => 1,
+            MouseButton::Right => 2,
+        }),
+        MouseAction::Drag(button) => Some(
+            32 + match button {
+                MouseButton::Left => 0,
+                MouseButton::Middle => 1,
+                MouseButton::Right => 2,
+            },
+        ),
+        MouseAction::Move => Some(35),
+        MouseAction::ScrollUp => Some(64),
+        MouseAction::ScrollDown => Some(65),
     }
 }
 
@@ -79,8 +143,8 @@ fn encode_control(character: char) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::encode_child_key;
-    use crate::{Key, Modifiers, SpecialKey};
+    use super::{encode_child_key, encode_child_mouse};
+    use crate::{Key, Modifiers, MouseAction, MouseButton, MouseEvent, SpecialKey};
     use bed_vt100::TerminalModes;
 
     #[test]
@@ -154,6 +218,71 @@ mod tests {
                 }
             ),
             b"\x1b[200~one\ntwo\x1b[201~"
+        );
+    }
+
+    #[test]
+    fn encodes_mouse_tracking_modes_and_coordinates() {
+        let event = MouseEvent {
+            row: 2,
+            column: 4,
+            action: MouseAction::Press(MouseButton::Left),
+            modifiers: Modifiers {
+                control: true,
+                ..Modifiers::default()
+            },
+        };
+        assert!(encode_child_mouse(event, TerminalModes::default()).is_empty());
+        assert_eq!(
+            encode_child_mouse(
+                event,
+                TerminalModes {
+                    mouse_tracking: Some(1000),
+                    sgr_mouse: true,
+                    ..TerminalModes::default()
+                }
+            ),
+            b"\x1b[<16;5;3M"
+        );
+        assert_eq!(
+            encode_child_mouse(
+                MouseEvent {
+                    action: MouseAction::Release(MouseButton::Left),
+                    ..event
+                },
+                TerminalModes {
+                    mouse_tracking: Some(1000),
+                    sgr_mouse: true,
+                    ..TerminalModes::default()
+                }
+            ),
+            b"\x1b[<16;5;3m"
+        );
+    }
+
+    #[test]
+    fn filters_motion_by_child_tracking_mode() {
+        let drag = MouseEvent {
+            row: 0,
+            column: 0,
+            action: MouseAction::Drag(MouseButton::Left),
+            modifiers: Modifiers::default(),
+        };
+        let normal = TerminalModes {
+            mouse_tracking: Some(1000),
+            sgr_mouse: true,
+            ..TerminalModes::default()
+        };
+        assert!(encode_child_mouse(drag, normal).is_empty());
+        assert_eq!(
+            encode_child_mouse(
+                drag,
+                TerminalModes {
+                    mouse_tracking: Some(1002),
+                    ..normal
+                }
+            ),
+            b"\x1b[<32;1;1M"
         );
     }
 }

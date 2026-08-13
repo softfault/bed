@@ -44,6 +44,13 @@ Enter return to Terminal Input and live output. `:` opens bed's command mode
 and `Ctrl-W` applies a window command. These are bed semantics rather than a
 Vim compatibility contract.
 
+Host mouse input is normalized to zero-based cell coordinates on every native
+backend. In Terminal Input, events inside the focused terminal's live content
+area are translated into child coordinates and filtered by the child's
+`1000`, `1002`, or `1003` tracking mode. SGR `1006` reports preserve press,
+release, drag, motion, wheel, and modifier information. Status rows, other
+windows, scrolled-back views, and bed-owned modes do not forward mouse input.
+
 `v` enters Terminal Visual, whose selection belongs to the view rather than the
 session. Cell motions account for wide graphemes, `y` copies into bed's shared
 register, and soft-wrapped rows are joined without an inserted newline. The
@@ -95,6 +102,7 @@ VT100 hardware emulation.
 6. Expected screen states for shell and application transcripts live in this repository.
 7. Native PTY/ConPTY tests cover output, input, resize, exit, forced termination, and teardown on runtime-tested platforms.
 8. OSC title termination, size bounds, recovery, and BEL delivery are covered across emulator, session, and TUI boundaries.
+9. Host parsing, child encoding, mode filtering, coordinate translation, and real PTY mouse delivery are tested independently.
 
 Arbitrary byte and resize streams should become fuzz targets after the core
 state model stabilizes.

@@ -275,7 +275,7 @@ fn edits_resizes_and_restores_a_real_pseudo_terminal() -> io::Result<()> {
     terminal.wait_for_frame()?;
     terminal.write_input("ihello好\x1b:wq\r".as_bytes())?;
 
-    terminal.wait_for_output(b"\x1b[?25h\x1b[?2004l\x1b[?1049l\x1b[0 q")?;
+    terminal.wait_for_output(b"\x1b[?25h\x1b[?1006l\x1b[?1003l\x1b[?2004l\x1b[?1049l\x1b[0 q")?;
     let status = child.wait()?;
     assert!(status.success());
     assert_eq!(fs::read(&path.0)?, "hello好".as_bytes());
@@ -295,7 +295,7 @@ fn restores_a_real_pseudo_terminal_during_panic_unwind() -> io::Result<()> {
 
     terminal.wait_for_output(b"PANIC_READY")?;
     terminal.write_input(b"x")?;
-    terminal.wait_for_output(b"\x1b[?25h\x1b[?2004l\x1b[?1049l\x1b[0 q")?;
+    terminal.wait_for_output(b"\x1b[?25h\x1b[?1006l\x1b[?1003l\x1b[?2004l\x1b[?1049l\x1b[0 q")?;
     let status = child.wait()?;
 
     assert!(!status.success());

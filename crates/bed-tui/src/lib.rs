@@ -18,7 +18,7 @@ use bed_core::{
     BufferId, Document, Editor, RegexPattern, SelectionKind, SubstituteOptions, SubstituteRange,
     ViewId,
 };
-use bed_terminal::{Key, SpecialKey, TerminalSize};
+use bed_terminal::{Key, MouseEvent, SpecialKey, TerminalSize};
 use bed_terminal_session::{TerminalSessionId, TerminalStore};
 use bed_vt100::{Attributes, Color, Row, Screen};
 use file_tree::{FileTree, TreeEntryKind};
@@ -323,6 +323,52 @@ impl App {
             Mode::TerminalVisual => self.handle_terminal_visual_key(key),
         }
         Ok(())
+    }
+
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if self.mode != Mode::TerminalInput {
+            return;
+        }
+        let Some(view_id) = self.active_terminal_view_id() else {
+            return;
+        };
+        let Some((_, area)) = self
+            .layout
+            .rectangles(self.editor_area())
+            .into_iter()
+            .find(|(window_id, _)| *window_id == self.active_window)
+        else {
+            return;
+        };
+        let text_rows = area.rows.saturating_sub(1);
+        if mouse.row < area.row
+            || mouse.row >= area.row.saturating_add(text_rows)
+            || mouse.column < area.column
+            || mouse.column >= area.column.saturating_add(area.columns)
+        {
+            return;
+        }
+        let Some(view) = self.terminal_views.get(&view_id) else {
+            return;
+        };
+        if view.scrollback > 0 {
+            return;
+        }
+        let Some(session) = self.terminals.get(view.session_id) else {
+            return;
+        };
+        let child_event = MouseEvent {
+            row: mouse.row - area.row,
+            column: mouse.column - area.column,
+            ..mouse
+        };
+        if let Err(error) = session.send_mouse(child_event) {
+            self.message = format!("Terminal mouse failed: {error:#}");
+        }
+    }
+
+    pub fn handle_resize(&mut self, size: TerminalSize) {
+        self.last_size = size;
     }
 
     pub fn render(&mut self, size: TerminalSize) -> Vec<u8> {
@@ -4061,6 +4107,92 @@ mod tests {
         assert!(
             app.message
                 .contains(&format!("Terminal {} bell", session_id.get()))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_mouse_uses_child_coordinates_and_ignores_status_rows() {
+        use bed_terminal::{Modifiers, MouseAction, MouseButton, MouseEvent};
+        use std::{
+            thread,
+            time::{Duration, Instant},
+        };
+
+        let mut app = app_with(b"");
+        app.render(TerminalSize {
+            rows: 20,
+            columns: 80,
+        });
+        execute(
+            &mut app,
+            concat!(
+                "terminal stty raw -echo; ",
+                "printf '\\033[?1000h\\033[?1006hMOUSE_READY'; ",
+                "bytes=$(dd bs=1 count=9 2>/dev/null | od -An -tx1 | tr -d ' \\n'); ",
+                "[ \"$bytes\" = 1b5b3c303b333b324d ] && printf '\\r\\nMOUSE_OK\\r\\n'"
+            ),
+        );
+        app.render(TerminalSize {
+            rows: 20,
+            columns: 80,
+        });
+        let session_id = app.active_terminal_session_id().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app
+            .terminals
+            .get(session_id)
+            .is_some_and(|session| session.modes().mouse_tracking != Some(1000))
+        {
+            app.poll_terminals().unwrap();
+            assert!(Instant::now() < deadline, "mouse mode was not enabled");
+            thread::sleep(Duration::from_millis(2));
+        }
+
+        let area = app
+            .layout
+            .rectangles(app.editor_area())
+            .into_iter()
+            .find(|(id, _)| *id == app.active_window)
+            .unwrap()
+            .1;
+        app.handle_mouse(MouseEvent {
+            row: area.row + area.rows - 1,
+            column: area.column + 2,
+            action: MouseAction::Press(MouseButton::Left),
+            modifiers: Modifiers::default(),
+        });
+        app.handle_key(Key::Ctrl('\\')).unwrap();
+        app.handle_key(Key::Ctrl('n')).unwrap();
+        app.handle_mouse(MouseEvent {
+            row: area.row + 1,
+            column: area.column + 2,
+            action: MouseAction::Press(MouseButton::Left),
+            modifiers: Modifiers::default(),
+        });
+        app.handle_key(Key::Char('i')).unwrap();
+        app.handle_mouse(MouseEvent {
+            row: area.row + 1,
+            column: area.column + 2,
+            action: MouseAction::Press(MouseButton::Left),
+            modifiers: Modifiers::default(),
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.terminals.get(session_id).is_some_and(|session| {
+            session.status().is_none() || !session.screen().contents().contains("MOUSE_OK")
+        }) {
+            app.poll_terminals().unwrap();
+            assert!(Instant::now() < deadline, "mouse input did not reach child");
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            app.terminals
+                .get(session_id)
+                .unwrap()
+                .screen()
+                .contents()
+                .contains("MOUSE_OK")
         );
     }
 

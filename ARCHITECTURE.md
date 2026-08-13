@@ -36,8 +36,8 @@ Terminal::draw(&mut self, bytes: &[u8]) -> Result<()>
 Backends are selected at compile time. There is no dynamic backend trait or platform state in the editor core.
 
 The application claims host input through `Terminal::events` and receives
-bounded batches of key and sized-resize events. Timeout batches provide a
-portable wakeup for polling child sessions when no key is pressed. Synchronous
+bounded batches of key, zero-based mouse, and sized-resize events. Timeout
+batches provide a portable wakeup for polling child sessions when no key is pressed. Synchronous
 `read_key` remains for narrow terminal tests, but cannot be used after input
 has been claimed by the event thread.
 
@@ -84,7 +84,9 @@ The file tree is also owned by `bed-tui`. Its root, expanded paths, selection, a
 `bed-terminal::encode_child_key` performs the opposite boundary conversion for
 embedded sessions. It encodes semantic keys using the child's application
 cursor and bracketed-paste modes reported by `bed-vt100`; it does not inspect
-editor or window modes.
+editor or window modes. Mouse encoding likewise observes the child's tracking
+and SGR modes; `bed-tui` owns host-to-child coordinate translation and only
+forwards events from Terminal Input inside the focused live terminal content.
 
 The TUI uses a block cursor for Normal, Visual, command, search, tree, Terminal
 Normal, and Terminal Visual modes, and a bar cursor for Insert and Terminal

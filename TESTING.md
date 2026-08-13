@@ -30,6 +30,8 @@ boundary. Linux tests cover generated-response routing, mode-aware input, EOF
 finalization, exit status, coordinated PTY/emulator resize, stable IDs, and
 forced versus protected session closure. Capacity-one stress cases verify that
 input backpressure is reported and sustained output is drained without loss.
+Mouse tests cover host SGR parsing, native Windows record translation,
+child-mode filtering, coordinate translation, and delivery through a real PTY.
 The TUI additionally starts a real shell command, renders its attributed
 screen in a terminal window, retains its exit state, and detaches the view
 without discarding the session.

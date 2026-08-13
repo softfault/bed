@@ -7,7 +7,7 @@
 
 use anyhow::{Result, bail, ensure};
 use bed_pty::PtySize;
-use bed_terminal::Key;
+use bed_terminal::{Key, Modifiers, MouseAction, MouseButton, MouseEvent};
 use bed_terminal_session::{TerminalSession, TerminalStore};
 use std::{
     process::Command,
@@ -122,6 +122,37 @@ fn reports_bells_from_each_poll() -> Result<()> {
     })?;
 
     ensure!(bells == 2, "expected two bells, observed {bells}");
+    Ok(())
+}
+
+#[test]
+fn routes_mode_aware_mouse_input() -> Result<()> {
+    let mut command = Command::new("/bin/sh");
+    command.args([
+        "-c",
+        concat!(
+            "stty raw -echo; ",
+            "printf '\\033[?1002h\\033[?1006hMOUSE_READY'; ",
+            "bytes=$(dd bs=1 count=9 2>/dev/null | od -An -tx1 | tr -d ' \\n'); ",
+            "[ \"$bytes\" = 1b5b3c303b353b334d ] && printf '\\r\\nMOUSE_OK\\r\\n'"
+        ),
+    ]);
+    let mut session = TerminalSession::spawn(command, PtySize::new(4, 20)?, 0)?;
+    poll_until(&mut session, |session| {
+        session.modes().mouse_tracking == Some(1002) && session.modes().sgr_mouse
+    })?;
+
+    session.send_mouse(MouseEvent {
+        row: 2,
+        column: 4,
+        action: MouseAction::Press(MouseButton::Left),
+        modifiers: Modifiers::default(),
+    })?;
+    poll_until(&mut session, |session| {
+        session.screen().contents().contains("MOUSE_OK") && session.status().is_some()
+    })?;
+
+    ensure!(session.screen().contents().contains("MOUSE_OK"));
     Ok(())
 }
 

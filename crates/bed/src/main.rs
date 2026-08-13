@@ -22,7 +22,11 @@ fn main() -> Result<()> {
             }
             match event {
                 TerminalEvent::Key(key) => app.handle_key(key)?,
-                TerminalEvent::Resize(resized) => size = resized,
+                TerminalEvent::Mouse(mouse) => app.handle_mouse(mouse),
+                TerminalEvent::Resize(resized) => {
+                    size = resized;
+                    app.handle_resize(resized);
+                }
             }
         }
         app.poll_terminals()?;

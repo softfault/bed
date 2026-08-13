@@ -15,6 +15,8 @@ All notable changes to bed are documented in this file.
   graphemes, and soft-wrapped rows.
 - Bounded child-title handling in terminal status lines and visible, coalesced
   BEL feedback from embedded sessions.
+- Native host mouse input and mode-aware forwarding to focused embedded
+  terminals, including SGR coordinates, modifiers, dragging, and wheel events.
 
 ## [0.3.0] - 2026-08-13
 

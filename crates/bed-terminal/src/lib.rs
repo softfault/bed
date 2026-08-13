@@ -18,7 +18,7 @@ const EVENT_QUEUE_CAPACITY: usize = 256;
 
 mod child;
 
-pub use child::encode_child_key;
+pub use child::{encode_child_key, encode_child_mouse};
 
 #[cfg(all(
     any(
@@ -86,6 +86,31 @@ pub struct Modifiers {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseButton {
+    Left,
+    Middle,
+    Right,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseAction {
+    Press(MouseButton),
+    Release(MouseButton),
+    Drag(MouseButton),
+    Move,
+    ScrollUp,
+    ScrollDown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MouseEvent {
+    pub row: usize,
+    pub column: usize,
+    pub action: MouseAction,
+    pub modifiers: Modifiers,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpecialKey {
     Delete,
     ArrowUp,
@@ -142,7 +167,14 @@ pub struct TerminalEvents {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TerminalEvent {
     Key(Key),
+    Mouse(MouseEvent),
     Resize(TerminalSize),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HostInput {
+    Key(Key),
+    Mouse(MouseEvent),
 }
 
 impl Terminal {
@@ -177,8 +209,8 @@ impl Terminal {
             .spawn(move || {
                 loop {
                     let event = reader
-                        .read_key()
-                        .and_then(|key| classify_event(key, || reader.size()));
+                        .read_event()
+                        .and_then(|input| classify_event(input, || reader.size()));
                     let failed = event.is_err();
                     if sender.send(event).is_err() || failed {
                         break;
@@ -218,16 +250,23 @@ impl TerminalEvents {
     }
 }
 
-fn classify_event(key: Key, size: impl FnOnce() -> Result<TerminalSize>) -> Result<TerminalEvent> {
-    if key == Key::Resize {
-        return size().map(TerminalEvent::Resize);
+fn classify_event(
+    input: HostInput,
+    size: impl FnOnce() -> Result<TerminalSize>,
+) -> Result<TerminalEvent> {
+    match input {
+        HostInput::Key(Key::Resize) => size().map(TerminalEvent::Resize),
+        HostInput::Key(key) => Ok(TerminalEvent::Key(key)),
+        HostInput::Mouse(mouse) => Ok(TerminalEvent::Mouse(mouse)),
     }
-    Ok(TerminalEvent::Key(key))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Key, TerminalEvent, TerminalEvents, TerminalSize, classify_event};
+    use super::{
+        HostInput, Key, Modifiers, MouseAction, MouseButton, MouseEvent, TerminalEvent,
+        TerminalEvents, TerminalSize, classify_event,
+    };
     use anyhow::Result;
     use std::{
         cell::Cell,
@@ -239,7 +278,7 @@ mod tests {
     #[test]
     fn turns_resize_keys_into_sized_events() -> Result<()> {
         let queried = Cell::new(false);
-        let key = classify_event(Key::BackTab, || {
+        let key = classify_event(HostInput::Key(Key::BackTab), || {
             queried.set(true);
             Ok(TerminalSize {
                 rows: 20,
@@ -249,7 +288,7 @@ mod tests {
         assert_eq!(key, TerminalEvent::Key(Key::BackTab));
         assert!(!queried.get());
 
-        let resize = classify_event(Key::Resize, || {
+        let resize = classify_event(HostInput::Key(Key::Resize), || {
             queried.set(true);
             Ok(TerminalSize {
                 rows: 40,
@@ -264,6 +303,25 @@ mod tests {
             })
         );
         assert!(queried.get());
+
+        queried.set(false);
+        let mouse = MouseEvent {
+            row: 2,
+            column: 4,
+            action: MouseAction::Press(MouseButton::Left),
+            modifiers: Modifiers::default(),
+        };
+        assert_eq!(
+            classify_event(HostInput::Mouse(mouse), || {
+                queried.set(true);
+                Ok(TerminalSize {
+                    rows: 1,
+                    columns: 1,
+                })
+            })?,
+            TerminalEvent::Mouse(mouse)
+        );
+        assert!(!queried.get());
         Ok(())
     }
 

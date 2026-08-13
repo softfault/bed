@@ -11,7 +11,7 @@
 //!   and [`tcsetattr(3)`](https://man.netbsd.org/tcsetattr.3)
 //! - xterm [`ctlseqs`](https://invisible-island.net/xterm/ctlseqs/ctlseqs.html)
 
-use super::{Key, TerminalSize, vt::VtInput};
+use super::{HostInput, Key, TerminalSize, vt::VtInput};
 use anyhow::{Context, Result, ensure};
 use std::{
     cell::Cell,
@@ -41,10 +41,11 @@ const VMIN: usize = 16;
 const VTIME: usize = 17;
 const NCCS: usize = 20;
 
-// xterm private modes 1049, 2004, and 25 select the alternate screen,
-// bracketed paste, and cursor visibility respectively.
-const ENTER_TERMINAL_SCREEN: &[u8] = b"\x1b[?1049h\x1b[?2004h\x1b[?25l";
-const LEAVE_TERMINAL_SCREEN: &[u8] = b"\x1b[?25h\x1b[?2004l\x1b[?1049l\x1b[0 q";
+// xterm private modes select the alternate screen, bracketed paste, all-motion
+// SGR mouse reporting, and cursor visibility while bed owns the terminal.
+const ENTER_TERMINAL_SCREEN: &[u8] = b"\x1b[?1049h\x1b[?2004h\x1b[?1003h\x1b[?1006h\x1b[?25l";
+const LEAVE_TERMINAL_SCREEN: &[u8] =
+    b"\x1b[?25h\x1b[?1006l\x1b[?1003l\x1b[?2004l\x1b[?1049l\x1b[0 q";
 
 /// NetBSD `struct termios` from termios.h.
 #[repr(C)]
@@ -173,8 +174,8 @@ impl PlatformTerminalReader {
         Ok(size)
     }
 
-    pub(super) fn read_key(&mut self) -> Result<Key> {
-        read_key(&mut self.input, self.output_fd, &self.last_size)
+    pub(super) fn read_event(&mut self) -> Result<HostInput> {
+        read_event(&mut self.input, self.output_fd, &self.last_size)
     }
 }
 
@@ -191,6 +192,22 @@ fn read_key(
         let size = get_window_size(output_fd)?;
         if size != last_size.replace(size) {
             return Ok(Key::Resize);
+        }
+    }
+}
+
+fn read_event(
+    input: &mut VtInput<io::Stdin>,
+    output_fd: c_int,
+    last_size: &Cell<TerminalSize>,
+) -> Result<HostInput> {
+    loop {
+        if let Some(event) = input.read_event()? {
+            return Ok(event);
+        }
+        let size = get_window_size(output_fd)?;
+        if size != last_size.replace(size) {
+            return Ok(HostInput::Key(Key::Resize));
         }
     }
 }
