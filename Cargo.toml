@@ -6,6 +6,7 @@ members = [
     "crates/bed-file",
     "crates/bed-terminal",
     "crates/bed-tui",
+    "crates/bed-vt100",
 ]
 
 [workspace.package]

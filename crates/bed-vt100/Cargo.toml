@@ -1,0 +1,15 @@
+[package]
+name = "bed-vt100"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "Terminal-emulation state and incremental VT parser for bed"
+
+[dependencies]
+unicode-segmentation.workspace = true
+unicode-width.workspace = true
