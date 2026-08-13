@@ -15,7 +15,8 @@ mod layout;
 
 use anyhow::{Context, Result};
 use bed_core::{
-    BufferId, Document, Editor, RegexPattern, SubstituteOptions, SubstituteRange, ViewId,
+    BufferId, Document, Editor, RegexPattern, SelectionKind, SubstituteOptions, SubstituteRange,
+    ViewId,
 };
 use bed_terminal::{Key, SpecialKey, TerminalSize};
 use file_tree::{FileTree, TreeEntryKind};
@@ -31,6 +32,8 @@ const TAB_STOP: usize = 4;
 // Full-frame rendering hides the cursor, clears the display, draws windows by
 // absolute position, then restores the cursor at its final position.
 const BEGIN_FRAME: &[u8] = b"\x1b[?25l\x1b[H\x1b[2J";
+const BLOCK_CURSOR: &[u8] = b"\x1b[2 q";
+const BAR_CURSOR: &[u8] = b"\x1b[6 q";
 const REVERSE_VIDEO: &[u8] = b"\x1b[7m";
 const RESET_STYLE: &[u8] = b"\x1b[m";
 const VERTICAL_SEPARATOR: &[u8] = "│".as_bytes();
@@ -44,6 +47,8 @@ const FILE_TREE_HIDE_COLUMNS: usize = 40;
 pub enum Mode {
     Normal,
     Insert,
+    Visual,
+    VisualLine,
     Command,
     Search,
     Tree,
@@ -166,6 +171,7 @@ pub struct App {
     editor: Editor,
     mode: Mode,
     command: String,
+    command_selection: Option<SelectionKind>,
     search: String,
     last_search: Option<RegexPattern>,
     message: String,
@@ -210,6 +216,7 @@ impl App {
             editor,
             mode: Mode::Normal,
             command: String::new(),
+            command_selection: None,
             search: String::new(),
             last_search: None,
             message: String::from("i: insert  :w: save  :q: quit"),
@@ -253,6 +260,8 @@ impl App {
         match self.mode {
             Mode::Normal => self.handle_normal_key(key)?,
             Mode::Insert => self.handle_insert_key(key)?,
+            Mode::Visual => self.handle_visual_key(key, SelectionKind::Character)?,
+            Mode::VisualLine => self.handle_visual_key(key, SelectionKind::Line)?,
             Mode::Command => self.handle_command_key(key)?,
             Mode::Search => self.handle_search_key(key),
             Mode::Tree => self.handle_tree_key(key),
@@ -289,6 +298,9 @@ impl App {
                 .view_id;
             let switched = self.editor.switch_view(view_id);
             debug_assert!(switched);
+            if window_id == active_window && self.mode != Mode::Insert {
+                self.editor.normalize_normal_cursor();
+            }
             self.render_window(&mut output, window_id, area);
             if window_id == active_window {
                 editor_cursor = self.window_cursor(area);
@@ -300,7 +312,9 @@ impl App {
         let prompt = match self.mode {
             Mode::Command => format!(":{}", self.command),
             Mode::Search => format!("/{}", self.search),
-            Mode::Normal | Mode::Insert | Mode::Tree => self.message.clone(),
+            Mode::Normal | Mode::Insert | Mode::Visual | Mode::VisualLine | Mode::Tree => {
+                self.message.clone()
+            }
         };
         let prompt_width = display_width(&prompt);
         // Reserve the last cell for the command cursor and horizontally scroll
@@ -316,18 +330,19 @@ impl App {
         let (cursor_row, cursor_column) = match self.mode {
             Mode::Command | Mode::Search => (rows, prompt_width.saturating_sub(prompt_offset) + 1),
             Mode::Tree => tree_cursor,
-            Mode::Normal | Mode::Insert => editor_cursor,
+            Mode::Normal | Mode::Insert | Mode::Visual | Mode::VisualLine => editor_cursor,
         };
-        output.extend_from_slice(
-            // CSI H positions the cursor; xterm private mode 25 makes it visible
-            // only after the complete frame has been emitted.
-            format!(
-                "\x1b[{};{}H\x1b[?25h",
-                cursor_row.min(rows),
-                cursor_column.min(columns)
-            )
-            .as_bytes(),
+        move_to(
+            &mut output,
+            cursor_row.min(rows),
+            cursor_column.min(columns),
         );
+        output.extend_from_slice(if self.mode == Mode::Insert {
+            BAR_CURSOR
+        } else {
+            BLOCK_CURSOR
+        });
+        output.extend_from_slice(b"\x1b[?25h");
         output
     }
 
@@ -344,6 +359,17 @@ impl App {
         self.scroll_window(window_id, viewport_rows, text_columns);
 
         let viewport = self.window_viewport(window_id).clone();
+        let selection_kind = match self.mode {
+            Mode::Visual => Some(SelectionKind::Character),
+            Mode::VisualLine => Some(SelectionKind::Line),
+            _ => None,
+        };
+        let selection = (window_id == self.active_window)
+            .then(|| {
+                selection_kind
+                    .and_then(|kind| self.editor.selection_range(kind).map(|range| (range, kind)))
+            })
+            .flatten();
         for screen_row in 0..text_rows {
             move_to(output, area.row + screen_row + 1, area.column + 1);
             let document_row = viewport.row_offset + screen_row;
@@ -354,8 +380,20 @@ impl App {
                 );
             }
             if let Some(line) = line {
+                let line_start = self
+                    .editor
+                    .line_byte_range(document_row)
+                    .expect("rendered line is missing its byte range")
+                    .start;
                 output.extend_from_slice(
-                    render_text(line, viewport.column_offset, text_columns).as_bytes(),
+                    render_text_with_selection(
+                        line,
+                        line_start,
+                        selection.as_ref().map(|(range, kind)| (range, *kind)),
+                        viewport.column_offset,
+                        text_columns,
+                    )
+                    .as_bytes(),
                 );
             } else if line_number_width == 0 {
                 output.push(b'~');
@@ -602,6 +640,8 @@ impl App {
             }
             Key::Char('g') => self.pending = Some(Pending::Go),
             Key::Char('G') => self.editor.move_to_last_line(),
+            Key::Char('v') => self.enter_visual(SelectionKind::Character),
+            Key::Char('V') => self.enter_visual(SelectionKind::Line),
             Key::Char('d') => self.pending = Some(Pending::Delete),
             Key::Char('y') => self.pending = Some(Pending::Yank),
             Key::Char('x') | Key::Delete | Key::Modified(SpecialKey::Delete, _) => {
@@ -656,8 +696,7 @@ impl App {
                 self.insert_back_on_unchanged = false;
             }
             Key::Char(':') => {
-                self.mode = Mode::Command;
-                self.command.clear();
+                self.enter_command_mode(None);
             }
             Key::Char('/') => {
                 self.mode = Mode::Search;
@@ -689,6 +728,93 @@ impl App {
                 .message
                 .push_str("Paste is only accepted in insert mode"),
             Key::Escape => self.pending = None,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn handle_visual_key(&mut self, key: Key, kind: SelectionKind) -> Result<()> {
+        if self.capture_count(&key) {
+            return Ok(());
+        }
+        if self.pending.take() == Some(Pending::Go) && key == Key::Char('g') {
+            self.count = None;
+            self.editor.move_to_first_line();
+            return Ok(());
+        }
+
+        let count = if key == Key::Char('g') {
+            1
+        } else {
+            self.count.take().unwrap_or(1)
+        };
+        match key {
+            Key::Escape | Key::Ctrl('c') => self.leave_visual(),
+            Key::Char('v') if kind == SelectionKind::Character => self.leave_visual(),
+            Key::Char('V') if kind == SelectionKind::Line => self.leave_visual(),
+            Key::Char('v') => self.mode = Mode::Visual,
+            Key::Char('V') => self.mode = Mode::VisualLine,
+            Key::Char('h') | Key::ArrowLeft | Key::Modified(SpecialKey::ArrowLeft, _) => {
+                for _ in 0..count {
+                    if !self.editor.move_left() {
+                        break;
+                    }
+                }
+            }
+            Key::Char('j') | Key::ArrowDown | Key::Modified(SpecialKey::ArrowDown, _) => {
+                for _ in 0..count {
+                    if !self.editor.move_down(false) {
+                        break;
+                    }
+                }
+            }
+            Key::Char('k') | Key::ArrowUp | Key::Modified(SpecialKey::ArrowUp, _) => {
+                for _ in 0..count {
+                    if !self.editor.move_up(false) {
+                        break;
+                    }
+                }
+            }
+            Key::Char('l') | Key::ArrowRight | Key::Modified(SpecialKey::ArrowRight, _) => {
+                for _ in 0..count {
+                    if !self.editor.move_right(false) {
+                        break;
+                    }
+                }
+            }
+            Key::Char('0') | Key::Home | Key::Modified(SpecialKey::Home, _) => {
+                self.editor.move_line_start();
+            }
+            Key::Char('$') | Key::End | Key::Modified(SpecialKey::End, _) => {
+                self.editor.move_line_end(false);
+            }
+            Key::Char('w') => {
+                for _ in 0..count {
+                    if !self.editor.move_word_forward() {
+                        break;
+                    }
+                }
+            }
+            Key::Char('b') => {
+                for _ in 0..count {
+                    if !self.editor.move_word_backward() {
+                        break;
+                    }
+                }
+            }
+            Key::Char('e') => {
+                for _ in 0..count {
+                    if !self.editor.move_word_end() {
+                        break;
+                    }
+                }
+            }
+            Key::Char('g') => self.pending = Some(Pending::Go),
+            Key::Char('G') => self.editor.move_to_last_line(),
+            Key::Char('y') => self.yank_visual(kind),
+            Key::Char('d') | Key::Char('x') | Key::Delete => self.delete_visual(kind),
+            Key::Char('p') | Key::Char('P') => self.put_over_visual(kind)?,
+            Key::Char(':') => self.enter_command_mode(Some(kind)),
             _ => {}
         }
         Ok(())
@@ -758,11 +884,13 @@ impl App {
     fn handle_command_key(&mut self, key: Key) -> Result<()> {
         match key {
             Key::Escape | Key::Ctrl('c') => {
+                self.cancel_command_selection();
                 self.mode = Mode::Normal;
                 self.command.clear();
             }
             Key::Backspace => {
                 if self.command.pop().is_none() {
+                    self.cancel_command_selection();
                     self.mode = Mode::Normal;
                 }
             }
@@ -770,6 +898,8 @@ impl App {
                 let command = std::mem::take(&mut self.command);
                 self.mode = Mode::Normal;
                 self.execute_command(command.trim());
+                self.editor.clear_selection();
+                self.command_selection = None;
             }
             Key::Char(character) if !character.is_control() => self.command.push(character),
             _ => {}
@@ -865,7 +995,27 @@ impl App {
     }
 
     fn execute_command(&mut self, command: &str) {
-        match parse_command(command) {
+        let command = match parse_command(command) {
+            Command::Substitute {
+                range: SubstituteRange::CurrentLine,
+                expression,
+            } if self.command_selection.is_some() => Command::Substitute {
+                range: SubstituteRange::SelectedLines,
+                expression,
+            },
+            command => command,
+        };
+        let uses_selection = matches!(
+            command,
+            Command::Substitute {
+                range: SubstituteRange::SelectedLines,
+                ..
+            }
+        );
+        if self.command_selection.is_some() && !uses_selection {
+            self.editor.clear_selection();
+        }
+        match command {
             Command::Write { force } => {
                 self.save(force);
             }
@@ -1832,6 +1982,88 @@ impl App {
         self.insert_back_on_unchanged = back_on_unchanged;
     }
 
+    fn enter_visual(&mut self, kind: SelectionKind) {
+        self.editor.begin_selection();
+        self.mode = match kind {
+            SelectionKind::Character => Mode::Visual,
+            SelectionKind::Line => Mode::VisualLine,
+        };
+    }
+
+    fn leave_visual(&mut self) {
+        self.editor.clear_selection();
+        self.editor.normalize_normal_cursor();
+        self.pending = None;
+        self.count = None;
+        self.mode = Mode::Normal;
+    }
+
+    fn yank_visual(&mut self, kind: SelectionKind) {
+        let bytes = self.editor.selected_bytes(kind).unwrap_or_default();
+        self.register = Some(match kind {
+            SelectionKind::Character => Register::Character(bytes),
+            SelectionKind::Line => Register::Line(bytes),
+        });
+        self.editor.finish_selection(kind);
+        self.mode = Mode::Normal;
+        self.message.push_str(match kind {
+            SelectionKind::Character => "Text yanked",
+            SelectionKind::Line => "Lines yanked",
+        });
+    }
+
+    fn delete_visual(&mut self, kind: SelectionKind) {
+        let bytes = self.editor.selected_bytes(kind).unwrap_or_default();
+        let changes_document = self.editor.selection_range(kind).is_some_and(|range| {
+            range.start < range.end || (kind == SelectionKind::Line && range.start > 0)
+        });
+        if changes_document {
+            self.editor.checkpoint();
+            self.editor.delete_selection(kind);
+        } else {
+            self.editor.finish_selection(kind);
+        }
+        self.register = Some(match kind {
+            SelectionKind::Character => Register::Character(bytes),
+            SelectionKind::Line => Register::Line(bytes),
+        });
+        self.mode = Mode::Normal;
+    }
+
+    fn put_over_visual(&mut self, kind: SelectionKind) -> Result<()> {
+        let Some(replacement) = self.register.clone() else {
+            self.message.push_str("Register is empty");
+            return Ok(());
+        };
+        let selected = self.editor.selected_bytes(kind).unwrap_or_default();
+        let selection = self.editor.selection_range(kind);
+        let selected_to_end = selection
+            .as_ref()
+            .is_some_and(|range| range.end == self.editor.document().len());
+        self.editor.checkpoint();
+        self.editor.delete_selection(kind);
+
+        match replacement {
+            Register::Character(bytes) if selected_to_end && !self.editor.document().is_empty() => {
+                self.editor.put_after(&bytes)?;
+            }
+            Register::Character(bytes) => {
+                self.editor.put_before(&bytes)?;
+            }
+            Register::Line(bytes) if selected_to_end && !self.editor.document().is_empty() => {
+                self.editor.put_line_below(&bytes)?;
+            }
+            Register::Line(bytes) => self.editor.put_line_above(&bytes)?,
+        }
+        self.editor.normalize_normal_cursor();
+        self.register = Some(match kind {
+            SelectionKind::Character => Register::Character(selected),
+            SelectionKind::Line => Register::Line(selected),
+        });
+        self.mode = Mode::Normal;
+        Ok(())
+    }
+
     fn delete_line(&mut self) {
         if self.editor.document().is_empty() {
             return;
@@ -1978,6 +2210,19 @@ impl App {
         }
     }
 
+    fn enter_command_mode(&mut self, selection: Option<SelectionKind>) {
+        self.mode = Mode::Command;
+        self.command.clear();
+        self.command_selection = selection;
+    }
+
+    fn cancel_command_selection(&mut self) {
+        if self.command_selection.take().is_some() {
+            self.editor.clear_selection();
+            self.editor.normalize_normal_cursor();
+        }
+    }
+
     fn save(&mut self, force: bool) -> bool {
         let result = if force {
             self.editor.save_force()
@@ -2078,6 +2323,8 @@ impl App {
         let mode = match (active, self.mode) {
             (true, Mode::Normal) => "NORMAL",
             (true, Mode::Insert) => "INSERT",
+            (true, Mode::Visual) => "VISUAL",
+            (true, Mode::VisualLine) => "VISUAL LINE",
             (true, Mode::Command) => "COMMAND",
             (true, Mode::Search) => "SEARCH",
             (true, Mode::Tree) => "TREE",
@@ -2322,15 +2569,35 @@ fn document_label(document: &Document) -> String {
 }
 
 fn render_text(bytes: &[u8], column_offset: usize, width: usize) -> String {
-    let text = String::from_utf8_lossy(bytes);
+    render_text_with_selection(bytes, 0, None, column_offset, width)
+}
+
+fn render_text_with_selection(
+    bytes: &[u8],
+    document_offset: usize,
+    selection: Option<(&std::ops::Range<usize>, SelectionKind)>,
+    column_offset: usize,
+    width: usize,
+) -> String {
+    let (text, source_boundaries) = lossy_text_with_source_boundaries(bytes);
     let mut output = String::new();
     let mut source_column = 0;
     let end = column_offset.saturating_add(width);
+    let mut reverse = false;
 
-    for grapheme in text.graphemes(true) {
+    for (byte_offset, grapheme) in text.grapheme_indices(true) {
         let grapheme_width = grapheme_display_width(grapheme, source_column);
         let grapheme_end = source_column + grapheme_width;
         if grapheme_end > column_offset && source_column < end {
+            let grapheme_range = document_offset + source_boundaries[byte_offset]
+                ..document_offset + source_boundaries[byte_offset + grapheme.len()];
+            let selected = selection.is_some_and(|(selection, _)| {
+                grapheme_range.start < selection.end && grapheme_range.end > selection.start
+            });
+            if selected != reverse {
+                output.push_str(if selected { "\x1b[7m" } else { "\x1b[m" });
+                reverse = selected;
+            }
             let visible_start = source_column.max(column_offset);
             let visible_end = grapheme_end.min(end);
             if grapheme == "\t" {
@@ -2350,7 +2617,87 @@ fn render_text(bytes: &[u8], column_offset: usize, width: usize) -> String {
             break;
         }
     }
+    let line_end = document_offset + bytes.len();
+    let selects_line_end = selection.is_some_and(|(selection, kind)| match kind {
+        SelectionKind::Character => selection.start == line_end && selection.end == line_end,
+        SelectionKind::Line => {
+            (selection.start <= line_end && selection.end > document_offset)
+                || (selection.is_empty() && selection.start == line_end)
+        }
+    });
+    if selects_line_end && source_column >= column_offset && source_column < end {
+        if !reverse {
+            output.push_str("\x1b[7m");
+            reverse = true;
+        }
+        output.push(' ');
+    }
+    if reverse {
+        output.push_str("\x1b[m");
+    }
     output
+}
+
+fn lossy_text_with_source_boundaries(bytes: &[u8]) -> (String, Vec<usize>) {
+    let mut text = String::new();
+    let mut source_boundaries = vec![0];
+    let mut source_offset = 0;
+
+    while source_offset < bytes.len() {
+        let tail = &bytes[source_offset..];
+        let (valid, invalid_length) = match std::str::from_utf8(tail) {
+            Ok(valid) => (valid, None),
+            Err(error) => {
+                let valid_length = error.valid_up_to();
+                let valid = std::str::from_utf8(&tail[..valid_length])
+                    .expect("UTF-8 error reported a valid prefix");
+                (
+                    valid,
+                    Some(error.error_len().unwrap_or(tail.len() - valid_length)),
+                )
+            }
+        };
+
+        for (relative_offset, character) in valid.char_indices() {
+            let start = source_offset + relative_offset;
+            push_mapped_character(
+                &mut text,
+                &mut source_boundaries,
+                character,
+                start,
+                start + character.len_utf8(),
+            );
+        }
+        source_offset += valid.len();
+
+        let Some(invalid_length) = invalid_length else {
+            break;
+        };
+        push_mapped_character(
+            &mut text,
+            &mut source_boundaries,
+            '\u{fffd}',
+            source_offset,
+            source_offset + invalid_length,
+        );
+        source_offset += invalid_length;
+    }
+
+    (text, source_boundaries)
+}
+
+fn push_mapped_character(
+    text: &mut String,
+    source_boundaries: &mut Vec<usize>,
+    character: char,
+    source_start: usize,
+    source_end: usize,
+) {
+    let decoded_start = text.len();
+    text.push(character);
+    source_boundaries[decoded_start] = source_start;
+    source_boundaries.resize(text.len() + 1, source_start);
+    source_boundaries[text.len()] = source_end;
 }
 
 fn display_width(text: &str) -> usize {
@@ -2398,9 +2745,9 @@ fn render_line_number(row: usize, exists: bool, width: usize) -> String {
 mod tests {
     use super::{
         App, Command, DEFAULT_FILE_TREE_WIDTH, Mode, ParsedSubstitute, SplitAxis, display_width,
-        parse_command, parse_substitute_expression,
+        parse_command, parse_substitute_expression, render_text_with_selection,
     };
-    use bed_core::{Document, Editor, SubstituteOptions, SubstituteRange};
+    use bed_core::{Document, Editor, SelectionKind, SubstituteOptions, SubstituteRange};
     use bed_terminal::{Key, TerminalSize};
     use std::{
         path::PathBuf,
@@ -2435,6 +2782,107 @@ mod tests {
         assert_eq!(app.mode(), Mode::Normal);
         assert_eq!(app.editor().document().as_bytes(), b"bac");
         assert_eq!(app.editor().cursor().offset(), 0);
+    }
+
+    #[test]
+    fn visual_character_mode_selects_graphemes_and_yanks_them() {
+        let mut app = app_with("a👩🏽‍💻b".as_bytes());
+        app.handle_key(Key::Char('v')).unwrap();
+        app.handle_key(Key::Char('l')).unwrap();
+
+        let frame = String::from_utf8(app.render(TerminalSize {
+            rows: 6,
+            columns: 30,
+        }))
+        .unwrap();
+        assert_eq!(app.mode(), Mode::Visual);
+        assert!(frame.contains("VISUAL"));
+        assert!(frame.contains("\x1b[7ma👩🏽‍💻\x1b[m"));
+
+        app.handle_key(Key::Char('y')).unwrap();
+        assert_eq!(app.mode(), Mode::Normal);
+        assert_eq!(app.editor().cursor().offset(), 0);
+        app.handle_key(Key::Char('$')).unwrap();
+        app.handle_key(Key::Char('P')).unwrap();
+        assert_eq!(app.editor().document().as_bytes(), "a👩🏽‍💻a👩🏽‍💻b".as_bytes());
+    }
+
+    #[test]
+    fn visual_line_mode_deletes_crlf_lines_as_one_change() {
+        let mut app = app_with(b"one\r\ntwo\r\nthree");
+        app.handle_key(Key::Char('V')).unwrap();
+        app.handle_key(Key::Char('j')).unwrap();
+        assert_eq!(app.mode(), Mode::VisualLine);
+
+        app.handle_key(Key::Char('d')).unwrap();
+
+        assert_eq!(app.mode(), Mode::Normal);
+        assert_eq!(app.editor().document().as_bytes(), b"three");
+        app.handle_key(Key::Char('u')).unwrap();
+        assert_eq!(app.editor().document().as_bytes(), b"one\r\ntwo\r\nthree");
+    }
+
+    #[test]
+    fn visual_put_replaces_selection_and_keeps_deleted_text_in_the_register() {
+        let mut app = app_with(b"one two");
+        for key in [Key::Char('v'), Key::Char('e'), Key::Char('y')] {
+            app.handle_key(key).unwrap();
+        }
+        app.handle_key(Key::Char('w')).unwrap();
+        for key in [Key::Char('v'), Key::Char('e'), Key::Char('p')] {
+            app.handle_key(key).unwrap();
+        }
+
+        assert_eq!(app.editor().document().as_bytes(), b"one one");
+        app.handle_key(Key::Char('$')).unwrap();
+        app.handle_key(Key::Char('p')).unwrap();
+        assert_eq!(app.editor().document().as_bytes(), b"one onetwo");
+        app.handle_key(Key::Char('u')).unwrap();
+        assert_eq!(app.editor().document().as_bytes(), b"one one");
+    }
+
+    #[test]
+    fn visual_substitute_targets_selected_lines_without_vim_markers() {
+        let mut app = app_with(b"x=1\nx=2\nx=3");
+        app.handle_key(Key::Char('V')).unwrap();
+        app.handle_key(Key::Char('j')).unwrap();
+        app.handle_key(Key::Char(':')).unwrap();
+        assert_eq!(app.mode(), Mode::Command);
+        assert!(app.command.is_empty());
+        for character in "s/(x)/$1$1/".chars() {
+            app.handle_key(Key::Char(character)).unwrap();
+        }
+        app.handle_key(Key::Enter).unwrap();
+
+        assert_eq!(app.editor().document().as_bytes(), b"xx=1\nxx=2\nx=3");
+        assert_eq!(app.editor().view().selection_anchor(), None);
+    }
+
+    #[test]
+    fn cancelling_a_visual_command_clears_the_selection() {
+        let mut app = app_with(b"one two");
+        app.handle_key(Key::Char('v')).unwrap();
+        app.handle_key(Key::Char('e')).unwrap();
+        app.handle_key(Key::Char(':')).unwrap();
+        app.handle_key(Key::Escape).unwrap();
+
+        assert_eq!(app.mode(), Mode::Normal);
+        assert_eq!(app.editor().view().selection_anchor(), None);
+    }
+
+    #[test]
+    fn non_selection_commands_leave_visual_without_stale_state() {
+        let mut app = app_with(b"one two");
+        app.handle_key(Key::Char('v')).unwrap();
+        app.handle_key(Key::Char('e')).unwrap();
+        app.handle_key(Key::Char(':')).unwrap();
+        for character in "buffers".chars() {
+            app.handle_key(Key::Char(character)).unwrap();
+        }
+        app.handle_key(Key::Enter).unwrap();
+
+        assert_eq!(app.mode(), Mode::Normal);
+        assert_eq!(app.editor().view().selection_anchor(), None);
     }
 
     #[test]
@@ -3379,7 +3827,85 @@ mod tests {
         assert!(frame.contains("NORMAL"));
         assert!(frame.contains("1 one"));
         assert!(frame.contains("2 你好"));
-        assert!(frame.ends_with("\x1b[2;3H\x1b[?25h"));
+        assert!(frame.ends_with("\x1b[2;3H\x1b[2 q\x1b[?25h"));
+    }
+
+    #[test]
+    fn invalid_utf8_selection_uses_original_document_offsets() {
+        let bytes = [0xff, b'a'];
+
+        assert_eq!(
+            render_text_with_selection(&bytes, 0, Some((&(1..2), SelectionKind::Character)), 0, 10,),
+            "�\x1b[7ma\x1b[m"
+        );
+        assert_eq!(
+            render_text_with_selection(&bytes, 0, Some((&(0..1), SelectionKind::Character)), 0, 10,),
+            "\x1b[7m�\x1b[ma"
+        );
+    }
+
+    #[test]
+    fn selection_rendering_respects_horizontal_clipping() {
+        assert_eq!(
+            render_text_with_selection(
+                "a好b".as_bytes(),
+                0,
+                Some((&(1..4), SelectionKind::Character)),
+                1,
+                2,
+            ),
+            "\x1b[7m好\x1b[m"
+        );
+        assert_eq!(
+            render_text_with_selection(
+                "a好b".as_bytes(),
+                0,
+                Some((&(1..4), SelectionKind::Character)),
+                2,
+                2,
+            ),
+            "\x1b[7m \x1b[mb"
+        );
+    }
+
+    #[test]
+    fn line_selection_highlights_line_end_without_extending_character_selection() {
+        assert_eq!(
+            render_text_with_selection(b"one", 0, Some((&(0..3), SelectionKind::Character)), 0, 10,),
+            "\x1b[7mone\x1b[m"
+        );
+        assert_eq!(
+            render_text_with_selection(b"one", 0, Some((&(0..3), SelectionKind::Line)), 0, 10,),
+            "\x1b[7mone \x1b[m"
+        );
+        assert_eq!(
+            render_text_with_selection(b"two", 4, Some((&(0..4), SelectionKind::Line)), 0, 10,),
+            "two"
+        );
+        assert_eq!(
+            render_text_with_selection(b"", 4, Some((&(4..4), SelectionKind::Line)), 0, 10,),
+            "\x1b[7m \x1b[m"
+        );
+    }
+
+    #[test]
+    fn cursor_shape_distinguishes_insert_mode() {
+        let mut app = app_with(b"");
+        let size = TerminalSize {
+            rows: 6,
+            columns: 20,
+        };
+
+        let frame = String::from_utf8(app.render(size)).unwrap();
+        assert!(frame.ends_with("\x1b[2 q\x1b[?25h"));
+
+        app.handle_key(Key::Char('i')).unwrap();
+        let frame = String::from_utf8(app.render(size)).unwrap();
+        assert!(frame.ends_with("\x1b[6 q\x1b[?25h"));
+
+        app.handle_key(Key::Escape).unwrap();
+        let frame = String::from_utf8(app.render(size)).unwrap();
+        assert!(frame.ends_with("\x1b[2 q\x1b[?25h"));
     }
 
     #[test]
@@ -3402,11 +3928,11 @@ mod tests {
 
         app.handle_key(Key::Char(':')).unwrap();
         let frame = String::from_utf8(app.render(size)).unwrap();
-        assert!(frame.ends_with(":\x1b[6;2H\x1b[?25h"));
+        assert!(frame.ends_with(":\x1b[6;2H\x1b[2 q\x1b[?25h"));
 
         app.handle_key(Key::Char('w')).unwrap();
         let frame = String::from_utf8(app.render(size)).unwrap();
-        assert!(frame.ends_with(":w\x1b[6;3H\x1b[?25h"));
+        assert!(frame.ends_with(":w\x1b[6;3H\x1b[2 q\x1b[?25h"));
     }
 
     #[test]
@@ -3423,7 +3949,7 @@ mod tests {
         });
         let frame = String::from_utf8(frame).unwrap();
 
-        assert!(frame.ends_with("ite\x1b[6;4H\x1b[?25h"));
+        assert!(frame.ends_with("ite\x1b[6;4H\x1b[2 q\x1b[?25h"));
     }
 
     #[test]
@@ -3439,7 +3965,7 @@ mod tests {
         });
         let frame = String::from_utf8(frame).unwrap();
 
-        assert!(frame.ends_with("\x1b[2;5H\x1b[?25h"));
+        assert!(frame.ends_with("\x1b[2;5H\x1b[2 q\x1b[?25h"));
     }
 
     #[test]
@@ -3614,6 +4140,6 @@ mod tests {
         app.handle_key(Key::Char('x')).unwrap();
         let frame = String::from_utf8(app.render(size)).unwrap();
 
-        assert!(frame.ends_with("/x\x1b[6;3H\x1b[?25h"));
+        assert!(frame.ends_with("/x\x1b[6;3H\x1b[2 q\x1b[?25h"));
     }
 }
