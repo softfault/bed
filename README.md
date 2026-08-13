@@ -39,6 +39,7 @@ Normal mode:
 - `x`, `dd`, `dw`, `d$`: delete character, line, word, or to line end
 - `yy`, `yw`, `y$`, `p`, `P`: yank and put characterwise or linewise text
 - `/PATTERN`, `n`, `N`: regular-expression search, repeat forward, repeat backward
+- `v` / `V`: start character or line selection
 - `u`, `Ctrl-R`: undo and redo
 - `Ctrl-W` followed by `h`, `j`, `k`, `l`, or `w`: move between split windows
 - `[count] Ctrl-W <` / `>`: decrease/increase the active window width
@@ -56,6 +57,18 @@ Insert mode:
 - Type or paste to insert; `Tab`, `Enter`, `Backspace`, and `Delete` edit text
 - `Escape` or `Ctrl-C`: return to normal mode
 
+Visual modes:
+
+- Use Normal-mode motions and counts to extend a character or line selection
+- `y`: yank the selection; `d`, `x`, or `Delete`: delete it
+- `p` / `P`: replace the selection with the register and retain the replaced text
+- `v` / `V`: switch selection kind; repeat the active key, `Escape`, or `Ctrl-C` to leave Visual mode
+- `:s/PATTERN/REPLACEMENT/[FLAGS]`: substitute on the selected lines
+
+Visual commands are intentionally bed-specific. Entering `:` does not insert
+Vim's `'<,'>` range markers, and an explicit `:%s` still addresses the whole
+buffer.
+
 Commands:
 
 - `:w`: save unless the file changed externally; `:w!` explicitly overwrites it
@@ -64,7 +77,7 @@ Commands:
 - `:buffer N` or `:b N`: switch to buffer number `N`
 - `:buffers` or `:ls`: list open buffers
 - `:edit PATH` or `:e PATH`: open or switch to a path
-- `:s/PATTERN/REPLACEMENT/[FLAGS]`: substitute on the current line
+- `:s/PATTERN/REPLACEMENT/[FLAGS]`: substitute on the current line, or on selected lines when entered from Visual mode
 - `:%s/PATTERN/REPLACEMENT/[FLAGS]`: substitute throughout the buffer
 - `:bdelete [N]` or `:bd [N]`: close a clean buffer; append `!` to discard its changes
 - `:split [PATH]` / `:vsplit [PATH]`: split the active window horizontally/vertically, optionally opening a path in the new window

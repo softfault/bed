@@ -75,7 +75,7 @@ const VK_DELETE: Word = 0x2e;
 // xterm private modes 1049 and 25 select the alternate screen and cursor
 // visibility respectively.
 const ENTER_TERMINAL_SCREEN: &[u8] = b"\x1b[?1049h\x1b[?25l";
-const LEAVE_TERMINAL_SCREEN: &[u8] = b"\x1b[?25h\x1b[?1049l";
+const LEAVE_TERMINAL_SCREEN: &[u8] = b"\x1b[?25h\x1b[?1049l\x1b[0 q";
 
 /// Win32 `COORD`.
 #[repr(C)]

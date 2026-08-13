@@ -33,7 +33,7 @@ Backends are selected at compile time. There is no dynamic backend trait or plat
 
 - `BufferStore` assigns a stable `BufferId` to each open `Buffer`.
 - `Buffer` owns one `Document` and its bounded undo/redo history.
-- `EditorView` identifies a buffer and owns its cursor and preferred column; stable `ViewId` values allow several views to refer to one buffer.
+- `EditorView` identifies a buffer and owns its cursor, preferred column, and optional selection anchor; stable `ViewId` values allow several views to refer to one buffer.
 - `Editor` coordinates buffers and views, and presents the active view through the editing API.
 
 `RegexPattern` compiles byte-oriented modern regular expressions once and is
@@ -44,6 +44,12 @@ line-oriented, preserves native line separators, and expands the regex crate's
 the core owns matching, replacement, and undo semantics.
 
 Switching views never moves or copies document content. Undo/redo remains buffer-owned, while two split windows showing the same buffer retain independent cursors. Terminal-sized scrolling remains in `bed-tui`; each window associates its views with independent `Viewport` state.
+
+Character and line selections are therefore view-local even when their text is
+shared. The core clamps cursors and selection anchors after edits so another
+view shortening the same buffer cannot leave stale offsets. `Document` caches
+line starts for navigation, selection, substitution, and rendering; every
+mutation and undo/redo transition invalidates that cache.
 
 `bed-tui` represents each tab page as a lightweight layout workspace above the global buffer store. A tab has a stable `TabId`, a binary split tree, an active window, recent-window focus history, a stable automatic or explicit title, and file-tree navigation state. Split-tree leaves are stable window IDs; split nodes retain equal or side-anchored cell sizes, clamp them against the recursive minimum size of each child layout, and allocate terminal rectangles without owning editor content. Recent-tab history also uses stable IDs, so reordering tabs does not change close-time focus restoration.
 
@@ -60,6 +66,11 @@ The file tree is also owned by `bed-tui`. Its root, expanded paths, selection, a
 - `crates/bed-terminal/src/terminal/vt.rs` decodes UTF-8 and VT input sequences for byte-stream terminals. It is not compiled into the Windows build.
 
 `Key::Char(char)` is the platform boundary for typed text. VT backends also deliver bracketed paste as one `Key::Paste(String)` event, while the Windows console continues to provide structured character events. Native UTF-8 or UTF-16 fragments never enter the editing core.
+
+The TUI uses a block cursor for Normal, Visual, command, search, and tree
+modes, and a bar cursor for Insert mode. Every terminal backend restores the
+terminal-selected default cursor shape when bed exits, including panic
+unwinding on native backends that support it.
 
 ## Supported targets
 

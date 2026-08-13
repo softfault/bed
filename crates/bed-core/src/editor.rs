@@ -5,7 +5,10 @@
 //! Each buffer owns its bounded undo and redo history, while cursor navigation
 //! belongs to the active view.
 
-use crate::{Buffer, BufferId, BufferStore, Cursor, Document, EditorView, RegexPattern, ViewId};
+use crate::{
+    Buffer, BufferId, BufferStore, Cursor, Document, EditorView, RegexPattern, SelectionKind,
+    ViewId,
+};
 use anyhow::{Context, Result};
 use std::{
     collections::HashMap,
@@ -17,6 +20,7 @@ use unicode_segmentation::UnicodeSegmentation;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SubstituteRange {
     CurrentLine,
+    SelectedLines,
     Buffer,
 }
 
@@ -105,16 +109,29 @@ impl Editor {
 
     pub fn switch_view(&mut self, view_id: ViewId) -> bool {
         if view_id == self.view_id {
+            self.normalize_active_view_bounds();
             return true;
         }
-        let Some(next_view) = self.parked_views.remove(&view_id) else {
+        let Some(mut next_view) = self.parked_views.remove(&view_id) else {
             return false;
         };
+        let document_len = self
+            .buffers
+            .get(next_view.buffer_id)
+            .expect("editor view references a missing buffer")
+            .document()
+            .len();
+        normalize_view_bounds(&mut next_view, document_len);
         let previous_id = self.view_id;
         let previous_view = std::mem::replace(&mut self.view, next_view);
         self.view_id = view_id;
         self.parked_views.insert(previous_id, previous_view);
         true
+    }
+
+    fn normalize_active_view_bounds(&mut self) {
+        let document_len = self.document().len();
+        normalize_view_bounds(&mut self.view, document_len);
     }
 
     pub fn duplicate_view(&mut self, view_id: ViewId) -> Option<ViewId> {
@@ -175,6 +192,83 @@ impl Editor {
     pub fn checkpoint(&mut self) {
         let cursor = self.view.cursor().offset();
         self.buffer_mut().checkpoint(cursor);
+    }
+
+    pub fn begin_selection(&mut self) {
+        self.view.selection_anchor = Some(self.view.cursor.offset());
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.view.selection_anchor = None;
+    }
+
+    pub fn selection_range(&self, kind: SelectionKind) -> Option<std::ops::Range<usize>> {
+        let anchor = self.view.selection_anchor?;
+        let cursor = self.view.cursor.offset();
+        let first = anchor.min(cursor);
+        let last = anchor.max(cursor);
+        Some(match kind {
+            SelectionKind::Character => {
+                first..next_grapheme_offset(self.document().as_bytes(), last)
+            }
+            SelectionKind::Line => {
+                let start = self.document().line_start(first);
+                let line_end = self.document().line_end(last);
+                start..self.document().line_break_end(line_end)
+            }
+        })
+    }
+
+    pub fn selected_bytes(&self, kind: SelectionKind) -> Option<Vec<u8>> {
+        let mut range = self.selection_range(kind)?;
+        if kind == SelectionKind::Line {
+            let cursor = self.view.cursor.offset();
+            let anchor = self.view.selection_anchor?;
+            range.end = self.document().line_end(cursor.max(anchor));
+        }
+        Some(self.document().as_bytes()[range].to_vec())
+    }
+
+    pub fn finish_selection(&mut self, kind: SelectionKind) {
+        if let Some(range) = self.selection_range(kind) {
+            self.view
+                .cursor
+                .set_offset(range.start.min(self.document().len()));
+        }
+        self.clear_selection();
+        self.normalize_normal_cursor();
+    }
+
+    pub fn delete_selection(&mut self, kind: SelectionKind) -> Option<Vec<u8>> {
+        let mut range = self.selection_range(kind)?;
+        if kind == SelectionKind::Line
+            && range.start > 0
+            && range.end
+                == self.document().line_end(
+                    self.view.cursor.offset().max(
+                        self.view
+                            .selection_anchor
+                            .expect("selection range requires an anchor"),
+                    ),
+                )
+        {
+            range.start = self.document().preceding_line_break_start(range.start);
+        }
+        self.clear_selection();
+        if range.start >= range.end {
+            return None;
+        }
+        let start = range.start;
+        let deleted = self.document_mut().delete_range(range)?;
+        self.view
+            .cursor
+            .set_offset(start.min(self.document().len()));
+        if kind == SelectionKind::Line {
+            self.move_line_start();
+        } else {
+            self.normalize_normal_cursor();
+        }
+        Some(deleted)
     }
 
     pub fn undo(&mut self) -> bool {
@@ -814,13 +908,15 @@ impl Editor {
 
     pub fn position(&self) -> (usize, usize) {
         let offset = self.view.cursor.offset();
-        let row = self.document().as_bytes()[..offset.min(self.document().len())]
-            .iter()
-            .filter(|&&byte| byte == b'\n')
-            .count();
+        let row = self.document().row_for_offset(offset);
         let start = self.document().line_start(offset);
         let column = grapheme_count(&self.document().as_bytes()[start..offset]);
         (row, column)
+    }
+
+    pub fn line_byte_range(&self, row: usize) -> Option<std::ops::Range<usize>> {
+        let start = self.document().line_start_by_row(row)?;
+        Some(start..self.document().line_end(start))
     }
 
     fn move_vertical(&mut self, delta: isize, allow_line_end: bool) -> bool {
@@ -868,6 +964,17 @@ impl Editor {
             SubstituteRange::CurrentLine => {
                 let start = self.document().line_start(self.view.cursor.offset());
                 let end = self.document().line_end(self.view.cursor.offset());
+                start..self.document().line_break_end(end)
+            }
+            SubstituteRange::SelectedLines => {
+                let anchor = self
+                    .view
+                    .selection_anchor
+                    .unwrap_or(self.view.cursor.offset());
+                let first = anchor.min(self.view.cursor.offset());
+                let last = anchor.max(self.view.cursor.offset());
+                let start = self.document().line_start(first);
+                let end = self.document().line_end(last);
                 start..self.document().line_break_end(end)
             }
             SubstituteRange::Buffer => 0..self.document().len(),
@@ -1068,6 +1175,16 @@ fn grapheme_count(bytes: &[u8]) -> usize {
     String::from_utf8_lossy(bytes).graphemes(true).count()
 }
 
+fn normalize_view_bounds(view: &mut EditorView, document_len: usize) {
+    if view.cursor.offset() > document_len {
+        view.cursor.set_offset(document_len);
+        view.preferred_column = None;
+    }
+    if let Some(anchor) = view.selection_anchor {
+        view.selection_anchor = Some(anchor.min(document_len));
+    }
+}
+
 fn path_identity(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| lexical_absolute(path))
 }
@@ -1098,7 +1215,7 @@ fn lexical_absolute(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{Editor, SubstituteOptions, SubstituteRange};
-    use crate::{Document, RegexPattern};
+    use crate::{Document, RegexPattern, SelectionKind};
     use std::{
         fs,
         path::PathBuf,
@@ -1301,6 +1418,25 @@ mod tests {
         assert!(editor.remove_view(duplicate));
         assert!(!editor.switch_view(duplicate));
         assert!(!editor.remove_view(original));
+    }
+
+    #[test]
+    fn switching_views_clamps_a_cursor_after_shared_text_shrinks() {
+        let mut editor = editor_with(b"abcdef");
+        let original = editor.view_id();
+        editor.move_line_end(false);
+        let duplicate = editor.duplicate_view(original).unwrap();
+
+        assert!(editor.switch_view(duplicate));
+        editor.move_to_first_line();
+        editor.begin_selection();
+        editor.move_line_end(false);
+        editor.checkpoint();
+        editor.delete_selection(SelectionKind::Character);
+        assert_eq!(editor.document().as_bytes(), b"");
+
+        assert!(editor.switch_view(original));
+        assert_eq!(editor.cursor().offset(), 0);
     }
 
     #[test]
@@ -1590,6 +1726,67 @@ mod tests {
 
         assert_eq!(editor.document().as_bytes(), b"x");
         assert_eq!(editor.position(), (0, 0));
+    }
+
+    #[test]
+    fn character_selection_is_inclusive_and_grapheme_safe_in_both_directions() {
+        let mut editor = editor_with("a👩🏽‍💻b".as_bytes());
+        editor.begin_selection();
+        assert!(editor.move_right(false));
+        assert_eq!(
+            editor.selected_bytes(SelectionKind::Character).unwrap(),
+            "a👩🏽‍💻".as_bytes()
+        );
+
+        editor.clear_selection();
+        assert!(editor.move_right(false));
+        editor.begin_selection();
+        assert!(editor.move_left());
+        assert_eq!(
+            editor.selected_bytes(SelectionKind::Character).unwrap(),
+            "👩🏽‍💻b".as_bytes()
+        );
+    }
+
+    #[test]
+    fn line_selection_handles_crlf_and_the_last_line() {
+        let mut editor = editor_with(b"one\r\ntwo\r\nthree");
+        assert!(editor.move_down(false));
+        editor.begin_selection();
+        assert!(editor.move_down(false));
+
+        assert_eq!(
+            editor.selected_bytes(SelectionKind::Line).unwrap(),
+            b"two\r\nthree"
+        );
+        editor.checkpoint();
+        assert_eq!(
+            editor.delete_selection(SelectionKind::Line).unwrap(),
+            b"\r\ntwo\r\nthree"
+        );
+        assert_eq!(editor.document().as_bytes(), b"one");
+        assert!(editor.undo());
+        assert_eq!(editor.document().as_bytes(), b"one\r\ntwo\r\nthree");
+    }
+
+    #[test]
+    fn selected_line_substitution_preserves_current_replacement_semantics() {
+        let mut editor = editor_with(b"x=1\nx=2\nx=3");
+        editor.begin_selection();
+        assert!(editor.move_down(false));
+        let pattern = RegexPattern::compile("(x)").unwrap();
+
+        let result = editor
+            .substitute(
+                SubstituteRange::SelectedLines,
+                &pattern,
+                "$1$1",
+                SubstituteOptions::default(),
+            )
+            .unwrap();
+
+        assert_eq!(result.lines, 2);
+        assert_eq!(editor.document().as_bytes(), b"xx=1\nxx=2\nx=3");
     }
 
     #[test]
