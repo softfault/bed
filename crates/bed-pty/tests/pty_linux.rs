@@ -26,7 +26,7 @@ fn exchanges_data_and_resizes_a_real_pty() -> Result<()> {
         "-c",
         "stty size; printf 'TERM:%s READY' \"$TERM\"; IFS= read -r line; printf ':%s:' \"$line\"; stty size",
     ]);
-    let mut pty = PtyProcess::spawn(&mut command, PtySize::new(24, 80)?)?;
+    let mut pty = PtyProcess::spawn(command, PtySize::new(24, 80)?)?;
     ensure!(pty.process_id() > 0);
 
     let output = spawn_reader(pty.try_clone_reader()?);
@@ -64,7 +64,7 @@ fn preserves_an_explicit_terminal_type() -> Result<()> {
     command
         .args(["-c", "printf 'TERM:%s' \"$TERM\""])
         .env("TERM", "bed-test-terminal");
-    let mut pty = PtyProcess::spawn(&mut command, PtySize::new(4, 40)?)?;
+    let mut pty = PtyProcess::spawn(command, PtySize::new(4, 40)?)?;
     let output = spawn_reader(pty.try_clone_reader()?);
     let mut bytes = Vec::new();
 
@@ -88,7 +88,7 @@ fn routes_terminal_responses_through_a_real_pty() -> Result<()> {
             "esac"
         ),
     ]);
-    let mut pty = PtyProcess::spawn(&mut command, PtySize::new(6, 20)?)?;
+    let mut pty = PtyProcess::spawn(command, PtySize::new(6, 20)?)?;
     let output = spawn_reader(pty.try_clone_reader()?);
     let mut terminal = TerminalEmulator::new(6, 20, 20);
     let mut raw = Vec::new();
@@ -127,7 +127,7 @@ fn encodes_mode_dependent_input_for_a_real_pty() -> Result<()> {
             "esac"
         ),
     ]);
-    let mut pty = PtyProcess::spawn(&mut command, PtySize::new(6, 30)?)?;
+    let mut pty = PtyProcess::spawn(command, PtySize::new(6, 30)?)?;
     let output = spawn_reader(pty.try_clone_reader()?);
     let mut terminal = TerminalEmulator::new(6, 30, 0);
     terminal.process(b"\x1b[?1h\x1b[?2004h");
@@ -156,7 +156,7 @@ fn encodes_mode_dependent_input_for_a_real_pty() -> Result<()> {
 fn dropping_a_running_pty_terminates_and_reaps_the_child() -> Result<()> {
     let mut command = Command::new("/bin/sleep");
     command.arg("30");
-    let pty = PtyProcess::spawn(&mut command, PtySize::new(24, 80)?)?;
+    let pty = PtyProcess::spawn(command, PtySize::new(24, 80)?)?;
 
     let started = Instant::now();
     drop(pty);
@@ -171,7 +171,7 @@ fn dropping_a_running_pty_terminates_and_reaps_the_child() -> Result<()> {
 fn explicitly_terminates_a_running_pty_child() -> Result<()> {
     let mut command = Command::new("/bin/sleep");
     command.arg("30");
-    let mut pty = PtyProcess::spawn(&mut command, PtySize::new(24, 80)?)?;
+    let mut pty = PtyProcess::spawn(command, PtySize::new(24, 80)?)?;
 
     ensure!(pty.try_wait()?.is_none());
     pty.terminate()?;
@@ -189,7 +189,7 @@ fn terminating_a_pty_kills_the_child_process_group() -> Result<()> {
         "-c",
         "sleep 30 & child=$!; printf 'CHILD:%s\\n' \"$child\"; wait",
     ]);
-    let mut pty = PtyProcess::spawn(&mut command, PtySize::new(24, 80)?)?;
+    let mut pty = PtyProcess::spawn(command, PtySize::new(24, 80)?)?;
     let output = spawn_reader(pty.try_clone_reader()?);
     let mut bytes = Vec::new();
     read_until(&output, &mut bytes, b"\n")?;

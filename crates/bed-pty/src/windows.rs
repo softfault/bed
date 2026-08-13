@@ -183,7 +183,7 @@ pub(super) struct PlatformPtyProcess {
 }
 
 impl PlatformPtyProcess {
-    pub(super) fn spawn(command: &mut Command, size: PtySize) -> Result<Self> {
+    pub(super) fn spawn(mut command: Command, size: PtySize) -> Result<Self> {
         let (pseudo_input, parent_input) = create_anonymous_pipe("ConPTY input")?;
         let (parent_output, pseudo_output) = create_anonymous_pipe("ConPTY output")?;
 
@@ -221,8 +221,8 @@ impl PlatformPtyProcess {
             command.env("TERM", "xterm-256color");
         }
         let application_name = wide_string(command.get_program(), "program")?;
-        let mut command_line = command_line(command)?;
-        let mut environment = environment_block(command)?;
+        let mut command_line = command_line(&command)?;
+        let mut environment = environment_block(&command)?;
         let current_directory = command
             .get_current_dir()
             .map(|directory| wide_string(directory.as_os_str(), "current directory"))

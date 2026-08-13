@@ -1,0 +1,17 @@
+[package]
+name = "bed-terminal-session"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "Embedded terminal session lifecycle and event delivery for bed"
+
+[dependencies]
+anyhow.workspace = true
+bed-pty.workspace = true
+bed-terminal.workspace = true
+bed-vt100.workspace = true

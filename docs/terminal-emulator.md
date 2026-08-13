@@ -73,6 +73,7 @@ The embedded terminal remains pre-release until:
 - no patched or vendored terminal-emulator dependency remains in release packages.
 
 Workspace publishing must follow dependency order: publish `bed-vt100` before
-`bed-terminal` and `bed-pty`, then publish the application crates. Until
+`bed-terminal` and `bed-pty`, then `bed-terminal-session` and the application
+crates. Until
 `bed-vt100` exists in the registry, Cargo can list the dependent package
 contents but cannot prepare or verify those crates for upload in isolation.

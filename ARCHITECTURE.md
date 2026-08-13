@@ -4,7 +4,7 @@
 
 ## Layers
 
-The workspace is split into seven packages:
+The workspace is split into eight packages:
 
 | Package | Responsibility | Internal dependencies |
 | --- | --- | --- |
@@ -12,6 +12,7 @@ The workspace is split into seven packages:
 | `bed-file` | Recoverable file replacement and its narrow native boundary | None |
 | `bed-pty` | Native PTY/ConPTY spawning, I/O, resize, status, and teardown | None |
 | `bed-terminal` | Semantic input, child-key encoding, and native terminal backends | `bed-vt100` |
+| `bed-terminal-session` | Embedded terminal lifecycle, bounded byte delivery, and emulator ownership | `bed-pty`, `bed-terminal`, `bed-vt100` |
 | `bed-tui` | Modes, commands, layout, and frame rendering | `bed-core`, `bed-terminal` |
 | `bed-vt100` | Incremental VT parsing, screen state, modes, and scrollback | None |
 | `bed` | Argument parsing and the main event loop | Application libraries above |
@@ -92,8 +93,10 @@ unwinding on native backends that support it.
   starts the child with `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE`. It preserves
   Unicode arguments, the current directory, and explicit environment changes.
 
-`PtyProcess` exposes synchronous native handles. A later application event
-layer will move blocking reads and writes away from the rendering thread.
+`PtyProcess` exposes synchronous native handles. `bed-terminal-session` moves
+blocking reads and writes to dedicated threads connected through bounded
+channels. Its `poll` API keeps emulator mutation, generated-response routing,
+EOF finalization, process status, and UI-visible errors on the caller thread.
 
 The embedded terminal planned for 0.4.0 uses `bed-vt100`, an independently
 written terminal emulator maintained in this workspace. Terminal-emulation

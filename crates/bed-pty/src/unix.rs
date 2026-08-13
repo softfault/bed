@@ -71,7 +71,7 @@ pub(super) struct PlatformPtyProcess {
 }
 
 impl PlatformPtyProcess {
-    pub(super) fn spawn(command: &mut Command, size: PtySize) -> Result<Self> {
+    pub(super) fn spawn(mut command: Command, size: PtySize) -> Result<Self> {
         let size = native_size(size);
         let mut master_fd = -1;
         let mut slave_fd = -1;

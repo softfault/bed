@@ -1,0 +1,133 @@
+//! Linux integration tests for the asynchronous terminal-session boundary.
+
+#![cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+
+use anyhow::{Result, bail, ensure};
+use bed_pty::PtySize;
+use bed_terminal::Key;
+use bed_terminal_session::{TerminalSession, TerminalStore};
+use std::{
+    process::Command,
+    thread,
+    time::{Duration, Instant},
+};
+
+const TIMEOUT: Duration = Duration::from_secs(5);
+
+#[test]
+fn drives_modes_input_responses_eof_and_exit() -> Result<()> {
+    let mut command = Command::new("/bin/sh");
+    command.args([
+        "-c",
+        concat!(
+            "stty raw -echo; ",
+            "printf '\\033[?1h\\033[?2004h\\033[2;3H\\033[6n'; ",
+            "bytes=$(dd bs=1 count=28 2>/dev/null | od -An -tx1 | tr -d ' \\n'); ",
+            "case \"$bytes\" in ",
+            "1b5b323b33521b4f411b5b3230307e6f6e650a74776f1b5b3230317e) ",
+            "printf '\\r\\nSESSION_OK\\r\\n' ;; ",
+            "*) printf '\\r\\nSESSION_BAD:%s\\r\\n' \"$bytes\"; exit 1 ;; ",
+            "esac"
+        ),
+    ]);
+    let mut session = TerminalSession::spawn(command, PtySize::new(6, 30)?, 100)?;
+    poll_until(&mut session, |session| {
+        session.modes().application_cursor && session.modes().bracketed_paste
+    })?;
+
+    session.send_key(&Key::ArrowUp)?;
+    session.send_key(&Key::Paste("one\ntwo".to_owned()))?;
+    poll_until(&mut session, |session| {
+        session.screen().contents().contains("SESSION_OK")
+            && session.reached_eof()
+            && session.status().is_some()
+    })?;
+
+    ensure!(
+        session.screen().contents().contains("SESSION_OK"),
+        "child rejected session input: {:?}",
+        session.screen().contents()
+    );
+    ensure!(session.reached_eof(), "session did not observe PTY EOF");
+    ensure!(session.status().is_some_and(|status| status.success()));
+    Ok(())
+}
+
+#[test]
+fn resizes_emulator_and_pty_together() -> Result<()> {
+    let mut command = Command::new("/bin/sh");
+    command.args([
+        "-c",
+        "stty raw -echo; dd bs=1 count=1 2>/dev/null; stty size",
+    ]);
+    let mut session = TerminalSession::spawn(command, PtySize::new(4, 20)?, 0)?;
+    session.resize(PtySize::new(8, 40)?)?;
+    ensure!(session.screen().size() == (8, 40));
+    session.send_bytes(vec![b'x'])?;
+    poll_until(&mut session, |session| {
+        session.screen().contents().contains("8 40") && session.status().is_some()
+    })?;
+    ensure!(session.screen().contents().contains("8 40"));
+    Ok(())
+}
+
+#[test]
+fn store_keeps_stable_session_ids_and_protects_running_sessions() -> Result<()> {
+    let mut first = Command::new("/bin/sleep");
+    first.arg("30");
+    let mut second = Command::new("/bin/sleep");
+    second.arg("30");
+    let mut store = TerminalStore::new();
+    let first_id = store.spawn(first, PtySize::new(4, 20)?, 0)?;
+    let second_id = store.spawn(second, PtySize::new(4, 20)?, 0)?;
+
+    ensure!(first_id.get() == 0 && second_id.get() == 1);
+    ensure!(store.ids().collect::<Vec<_>>() == [first_id, second_id]);
+    ensure!(store.running_count()? == 2);
+    ensure!(store.close(first_id, false).is_err());
+    store.close(first_id, true)?;
+    ensure!(store.get(first_id).is_none());
+    ensure!(store.ids().collect::<Vec<_>>() == [second_id]);
+    store.close(second_id, true)?;
+    Ok(())
+}
+
+#[test]
+fn finalizes_incomplete_utf8_at_eof() -> Result<()> {
+    let mut command = Command::new("/bin/sh");
+    command.args(["-c", "printf '\\303'"]);
+    let mut session = TerminalSession::spawn(command, PtySize::new(2, 10)?, 0)?;
+
+    poll_until(&mut session, |session| {
+        session.reached_eof() && session.status().is_some()
+    })?;
+
+    ensure!(session.screen().contents().contains('\u{fffd}'));
+    Ok(())
+}
+
+fn poll_until(
+    session: &mut TerminalSession,
+    mut ready: impl FnMut(&TerminalSession) -> bool,
+) -> Result<()> {
+    let deadline = Instant::now() + TIMEOUT;
+    while !ready(session) {
+        session.poll()?;
+        if let Some(error) = session.error() {
+            bail!("terminal session failed: {error}");
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "timed out waiting for terminal session; screen={:?}, status={:?}, eof={}",
+                session.screen().contents(),
+                session.status(),
+                session.reached_eof()
+            );
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    Ok(())
+}

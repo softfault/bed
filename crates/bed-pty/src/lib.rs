@@ -93,13 +93,16 @@ pub struct PtyProcess {
 }
 
 impl PtyProcess {
-    /// Spawns a command attached to a native PTY or ConPTY.
+    /// Consumes and spawns a command attached to a native PTY or ConPTY.
+    ///
+    /// The backend replaces the command's standard streams and may add native
+    /// pre-exec state, so the command cannot be reused after this call.
     ///
     /// Explicit environment additions and removals are preserved on Windows.
     /// Rust's stable [`Command`] inspection API does not expose whether
     /// [`Command::env_clear`] was called, so that operation cannot currently
     /// be reproduced by the ConPTY backend.
-    pub fn spawn(command: &mut Command, size: PtySize) -> Result<Self> {
+    pub fn spawn(command: Command, size: PtySize) -> Result<Self> {
         Ok(Self {
             platform: platform::PlatformPtyProcess::spawn(command, size)?,
         })

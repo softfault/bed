@@ -6,6 +6,7 @@ members = [
     "crates/bed-file",
     "crates/bed-pty",
     "crates/bed-terminal",
+    "crates/bed-terminal-session",
     "crates/bed-tui",
     "crates/bed-vt100",
 ]
@@ -26,6 +27,7 @@ bed-core = { version = "0.3.0", path = "crates/bed-core" }
 bed-file = { version = "0.3.0", path = "crates/bed-file" }
 bed-pty = { version = "0.3.0", path = "crates/bed-pty" }
 bed-terminal = { version = "0.3.0", path = "crates/bed-terminal" }
+bed-terminal-session = { version = "0.3.0", path = "crates/bed-terminal-session" }
 bed-tui = { version = "0.3.0", path = "crates/bed-tui" }
 bed-vt100 = { version = "0.3.0", path = "crates/bed-vt100" }
 regex = "1.13.1"

@@ -62,6 +62,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "bed-terminal-session"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "bed-pty",
+ "bed-terminal",
+ "bed-vt100",
+]
+
+[[package]]
 name = "bed-tui"
 version = "0.3.0"
 dependencies = [

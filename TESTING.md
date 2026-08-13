@@ -24,6 +24,12 @@ termination, Drop cleanup, and routing a `bed-vt100` device-status response
 back to the child. It also routes application-cursor navigation and bracketed
 paste encoded by `bed-terminal` into a raw child session.
 
+`bed-terminal-session` drives that stack through its bounded asynchronous
+boundary. Linux tests cover generated-response routing, mode-aware input, EOF
+finalization, exit status, coordinated PTY/emulator resize, stable IDs, and
+forced versus protected session closure. Capacity-one stress cases verify that
+input backpressure is reported and sustained output is drained without loss.
+
 ## Cross-Target Checks
 
 Install each available target with `rustup target add <target>`, then run:
