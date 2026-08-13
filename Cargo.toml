@@ -4,6 +4,7 @@ members = [
     "crates/bed",
     "crates/bed-core",
     "crates/bed-file",
+    "crates/bed-pty",
     "crates/bed-terminal",
     "crates/bed-tui",
     "crates/bed-vt100",
@@ -23,8 +24,10 @@ readme = "README.md"
 anyhow = "1.0.104"
 bed-core = { version = "0.3.0", path = "crates/bed-core" }
 bed-file = { version = "0.3.0", path = "crates/bed-file" }
+bed-pty = { version = "0.3.0", path = "crates/bed-pty" }
 bed-terminal = { version = "0.3.0", path = "crates/bed-terminal" }
 bed-tui = { version = "0.3.0", path = "crates/bed-tui" }
+bed-vt100 = { version = "0.3.0", path = "crates/bed-vt100" }
 regex = "1.13.1"
 unicode-segmentation = "1.13.3"
 unicode-width = "0.2.2"

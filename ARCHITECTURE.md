@@ -4,18 +4,23 @@
 
 ## Layers
 
-The workspace is split into six packages:
+The workspace is split into seven packages:
 
 | Package | Responsibility | Internal dependencies |
 | --- | --- | --- |
 | `bed-core` | Buffers, view-local cursor state, editing operations, and undo/redo | `bed-file` |
 | `bed-file` | Recoverable file replacement and its narrow native boundary | None |
+| `bed-pty` | Native PTY/ConPTY spawning, I/O, resize, status, and teardown | None |
 | `bed-terminal` | Semantic input types and native terminal backends | None |
 | `bed-tui` | Modes, commands, layout, and frame rendering | `bed-core`, `bed-terminal` |
 | `bed-vt100` | Incremental VT parsing, screen state, modes, and scrollback | None |
-| `bed` | Argument parsing and the main event loop | All three libraries |
+| `bed` | Argument parsing and the main event loop | Application libraries above |
 
-`bed-core`, `bed-tui`, and the `bed` binary forbid unsafe code. Native ABI calls are confined to `bed-terminal` and the Windows replacement operation in `bed-file`; both deny unsafe operations outside explicit unsafe blocks.
+`bed-core`, `bed-tui`, `bed-vt100`, and the `bed` binary forbid unsafe code.
+Native ABI calls are confined to `bed-terminal`, `bed-pty`, and the Windows
+replacement operation in `bed-file`; these boundaries deny unsafe operations
+outside explicit unsafe blocks. `bed-pty` owns process and pseudoterminal
+handles but no terminal-emulator or UI state.
 
 The terminal boundary is deliberately small:
 
@@ -72,6 +77,18 @@ The TUI uses a block cursor for Normal, Visual, command, search, and tree
 modes, and a bar cursor for Insert mode. Every terminal backend restores the
 terminal-selected default cursor shape when bed exits, including panic
 unwinding on native backends that support it.
+
+## Pseudoterminal backends
+
+- `crates/bed-pty/src/unix.rs` uses `openpty`, creates a controlling terminal
+  for the child session, and owns resize, I/O, status, process-group
+  termination, and reaping on Linux, macOS, FreeBSD, and NetBSD.
+- `crates/bed-pty/src/windows.rs` owns ConPTY pipes and the pseudoconsole and
+  starts the child with `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE`. It preserves
+  Unicode arguments, the current directory, and explicit environment changes.
+
+`PtyProcess` exposes synchronous native handles. A later application event
+layer will move blocking reads and writes away from the rendering thread.
 
 The embedded terminal planned for 0.4.0 uses `bed-vt100`, an independently
 written terminal emulator maintained in this workspace. Terminal-emulation

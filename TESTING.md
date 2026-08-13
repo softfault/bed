@@ -13,7 +13,15 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo build --workspace --release --locked
 ```
 
-On Linux, macOS, FreeBSD, and NetBSD, `cargo test` includes a native pseudoterminal test. It covers raw-mode entry, idle resize detection, UTF-8 input and saving, normal restoration, default cursor-shape restoration, and restoration during panic unwinding.
+On Linux, macOS, FreeBSD, and NetBSD, `cargo test` includes a native
+pseudoterminal test for bed's outer terminal. It covers raw-mode entry, idle
+resize detection, UTF-8 input and saving, normal restoration, default
+cursor-shape restoration, and restoration during panic unwinding.
+
+Linux also runs `bed-pty` against a real child pseudoterminal. Those tests cover
+I/O, resize, terminal environment selection, exit status, explicit process-group
+termination, Drop cleanup, and routing a `bed-vt100` device-status response
+back to the child.
 
 ## Cross-Target Checks
 

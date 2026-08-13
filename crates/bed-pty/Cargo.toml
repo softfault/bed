@@ -1,0 +1,17 @@
+[package]
+name = "bed-pty"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "Native PTY and ConPTY process boundary for bed"
+
+[dependencies]
+anyhow.workspace = true
+
+[dev-dependencies]
+bed-vt100.workspace = true
