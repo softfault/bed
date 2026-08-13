@@ -69,9 +69,10 @@ lifetime without leaving hidden sessions unmanaged.
 
 The terminal status line prefers a non-empty OSC title and otherwise shows the
 spawned command. Host rendering replaces control characters in titles rather
-than forwarding them to the outer terminal. BEL is surfaced as a concise bed
-message; several bells delivered in one poll are combined into a count instead
-of emitting an audible control byte or flooding the message area.
+than forwarding them to the outer terminal. BEL and visual bell requests are
+surfaced as concise bed messages; several events delivered in one poll are
+combined into counts instead of emitting host control bytes or flooding the
+message area.
 
 ## Compatibility scope
 
@@ -83,6 +84,7 @@ interactive command-line programs:
 - CSI cursor movement, positioning, erasing, insertion/deletion, scrolling, SGR, margins, save/restore, and device status reports.
 - DEC private modes for cursor keys, alternate screen, cursor visibility, mouse reporting, and bracketed paste.
 - OSC window titles terminated by BEL or ST.
+- DEC private erase aliases (`CSI ? J` and `CSI ? K`) and visual bell (`ESC g`).
 - Resize behavior for both screens, cursor, margins, wide cells, and scrollback.
 
 Unsupported sequences are ignored safely and counted for diagnostics. The OSC

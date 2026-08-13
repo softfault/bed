@@ -126,6 +126,25 @@ fn reports_bells_from_each_poll() -> Result<()> {
 }
 
 #[test]
+fn reports_visual_bells_from_each_poll() -> Result<()> {
+    let mut command = Command::new("/bin/sh");
+    command.args(["-c", "printf '\\033g\\033gready'"]);
+    let mut session = TerminalSession::spawn(command, PtySize::new(2, 10)?, 0)?;
+    let mut visual_bells = 0;
+
+    poll_until_with(&mut session, |session, result| {
+        visual_bells += result.visual_bells;
+        session.reached_eof() && session.status().is_some()
+    })?;
+
+    ensure!(
+        visual_bells == 2,
+        "expected two visual bells, observed {visual_bells}"
+    );
+    Ok(())
+}
+
+#[test]
 fn routes_mode_aware_mouse_input() -> Result<()> {
     let mut command = Command::new("/bin/sh");
     command.args([

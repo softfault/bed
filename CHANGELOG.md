@@ -14,7 +14,9 @@ All notable changes to bed are documented in this file.
 - Cell-based terminal selection and register copying across scrollback, wide
   graphemes, and soft-wrapped rows.
 - Bounded child-title handling in terminal status lines and visible, coalesced
-  BEL feedback from embedded sessions.
+  audible and visual bell feedback from embedded sessions.
+- Visual bell and DEC private erase compatibility controls, with the remaining
+  differences from `vt100 0.15.2` documented explicitly.
 - Native host mouse input and mode-aware forwarding to focused embedded
   terminals, including SGR coordinates, modifiers, dragging, and wheel events.
 

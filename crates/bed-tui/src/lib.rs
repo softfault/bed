@@ -802,6 +802,17 @@ impl App {
                     self.message.push_str(&format!(" ({})", result.bells));
                 }
             }
+            if result.visual_bells > 0 {
+                if !self.message.is_empty() {
+                    self.message.push_str("; ");
+                }
+                self.message
+                    .push_str(&format!("Terminal {} visual bell", id.get()));
+                if result.visual_bells > 1 {
+                    self.message
+                        .push_str(&format!(" ({})", result.visual_bells));
+                }
+            }
             if let Some(error) = self.terminals.get(*id).and_then(|session| session.error()) {
                 if !self.message.is_empty() {
                     self.message.push_str("; ");
@@ -4078,7 +4089,7 @@ mod tests {
         let mut app = app_with(b"");
         execute(
             &mut app,
-            "terminal printf '\\033]2;child title\\033\\\\\\007\\007READY'",
+            "terminal printf '\\033]2;child title\\033\\\\\\007\\007\\033gREADY'",
         );
         let session_id = app.active_terminal_session_id().unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -4107,6 +4118,10 @@ mod tests {
         assert!(
             app.message
                 .contains(&format!("Terminal {} bell", session_id.get()))
+        );
+        assert!(
+            app.message
+                .contains(&format!("Terminal {} visual bell", session_id.get()))
         );
     }
 

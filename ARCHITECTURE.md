@@ -107,7 +107,7 @@ support it.
 blocking reads and writes to dedicated threads connected through bounded
 channels. Its `poll` API keeps emulator mutation, generated-response routing,
 EOF finalization, process status, bell deltas, and UI-visible errors on the
-caller thread.
+caller thread, including separate audible and visual bell deltas.
 
 The embedded terminal under development for 0.4.0 uses `bed-vt100`, an
 independently written terminal emulator maintained in this workspace.
@@ -122,11 +122,13 @@ terminal-mode compatibility. Terminal Visual owns a view-local cell selection,
 preserves wide graphemes and soft wrapping when copying, and writes to bed's
 shared register. The window status prefers the child's bounded OSC title and
 falls back to the spawn command; control characters are replaced at the host
-rendering boundary. BEL becomes visible editor feedback rather than being
-forwarded to the host terminal. Terminal-emulation state stays separate from
+rendering boundary. Audible and visual bells become visible editor feedback
+rather than being forwarded to the host terminal. Terminal-emulation state stays separate from
 the native PTY/ConPTY process boundary and UI placement. Its compatibility scope and
 release gates are defined in
-[`docs/terminal-emulator.md`](docs/terminal-emulator.md).
+[`docs/terminal-emulator.md`](docs/terminal-emulator.md), with the behavioral
+comparison to `vt100 0.15.2` recorded in
+[`docs/vt100-compatibility.md`](docs/vt100-compatibility.md).
 
 ## Supported targets
 

@@ -34,6 +34,7 @@ pub struct TerminalEmulator {
     responses: Vec<u8>,
     unsupported_sequences: usize,
     bell_count: usize,
+    visual_bell_count: usize,
     reset_count: u64,
     scrollback_capacity: usize,
 }
@@ -52,6 +53,7 @@ impl TerminalEmulator {
             responses: Vec::new(),
             unsupported_sequences: 0,
             bell_count: 0,
+            visual_bell_count: 0,
             reset_count: 0,
             scrollback_capacity,
         }
@@ -110,6 +112,10 @@ impl TerminalEmulator {
 
     pub fn bell_count(&self) -> usize {
         self.bell_count
+    }
+
+    pub fn visual_bell_count(&self) -> usize {
+        self.visual_bell_count
     }
 
     pub fn reset_count(&self) -> u64 {
@@ -301,6 +307,10 @@ impl TerminalEmulator {
                 self.reset();
                 self.state = ParserState::Ground;
             }
+            b'g' => {
+                self.visual_bell_count = self.visual_bell_count.saturating_add(1);
+                self.state = ParserState::Ground;
+            }
             b'(' | b')' | b'*' | b'+' | b'#' | b'%' => {
                 self.state = ParserState::EscapeIntermediate;
             }
@@ -431,6 +441,12 @@ impl TerminalEmulator {
                 .screen_mut()
                 .erase_display(raw_parameter(&parameters, 0, 0)),
             (None, b'K') => self
+                .screen_mut()
+                .erase_line(raw_parameter(&parameters, 0, 0)),
+            (Some(b'?'), b'J') => self
+                .screen_mut()
+                .erase_display(raw_parameter(&parameters, 0, 0)),
+            (Some(b'?'), b'K') => self
                 .screen_mut()
                 .erase_line(raw_parameter(&parameters, 0, 0)),
             (None, b'@') => self.screen_mut().insert_cells(first),
@@ -775,6 +791,21 @@ mod tests {
         assert_eq!(attributes.foreground, Color::Indexed(200));
         assert_eq!(attributes.background, Color::Rgb(1, 2, 3));
         assert_eq!(terminal.take_responses(), b"\x1b[1;2R");
+    }
+
+    #[test]
+    fn supports_visual_bells_and_private_erase_aliases() {
+        let mut terminal = TerminalEmulator::new(2, 8, 2);
+        terminal.process(b"\x1b[Hbefore\x1b[2;1Hsecond\x1b[H\x1b[?2K");
+        assert_eq!(terminal.screen().row(0).unwrap().text(), "");
+        assert_eq!(terminal.screen().row(1).unwrap().text(), "second");
+
+        terminal.process(b"\x1b[2;1H\x1b[?2K\x1b[Hafter\x1b[?2J\x1bg");
+
+        assert_eq!(terminal.visual_bell_count(), 1);
+        assert_eq!(terminal.screen().row(0).unwrap().text(), "");
+        assert_eq!(terminal.screen().row(1).unwrap().text(), "");
+        assert_eq!(terminal.unsupported_sequence_count(), 0);
     }
 
     #[test]
