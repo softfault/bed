@@ -6,6 +6,7 @@
 
 use anyhow::{Context, Result, ensure};
 use std::{
+    cell::OnceCell,
     fs,
     io::ErrorKind,
     ops::Range,
@@ -20,6 +21,7 @@ pub struct Document {
     saved_bytes: Vec<u8>,
     saved_file_state: SavedFileState,
     line_ending: LineEnding,
+    line_starts: OnceCell<Vec<usize>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +48,7 @@ impl Document {
             saved_bytes,
             saved_file_state: SavedFileState::Untracked,
             line_ending,
+            line_starts: OnceCell::new(),
         }
     }
 
@@ -79,6 +82,7 @@ impl Document {
         );
 
         self.bytes.insert(offset, byte);
+        self.invalidate_line_starts();
         Ok(())
     }
 
@@ -91,6 +95,7 @@ impl Document {
 
         if !bytes.is_empty() {
             self.bytes.splice(offset..offset, bytes.iter().copied());
+            self.invalidate_line_starts();
         }
         Ok(())
     }
@@ -100,7 +105,9 @@ impl Document {
             return None;
         }
 
-        Some(self.bytes.remove(offset))
+        let byte = self.bytes.remove(offset);
+        self.invalidate_line_starts();
+        Some(byte)
     }
 
     pub fn delete_range(&mut self, range: Range<usize>) -> Option<Vec<u8>> {
@@ -108,7 +115,9 @@ impl Document {
             return None;
         }
 
-        Some(self.bytes.drain(range).collect())
+        let bytes = self.bytes.drain(range).collect();
+        self.invalidate_line_starts();
+        Some(bytes)
     }
 
     pub fn save(&mut self) -> Result<()> {
@@ -162,7 +171,7 @@ impl Document {
     }
 
     pub fn line_count(&self) -> usize {
-        self.bytes.iter().filter(|&&byte| byte == b'\n').count() + 1
+        self.line_starts().len()
     }
 
     pub fn line(&self, row: usize) -> Option<&[u8]> {
@@ -172,23 +181,19 @@ impl Document {
     }
 
     pub(crate) fn line_start(&self, offset: usize) -> usize {
-        let offset = offset.min(self.bytes.len());
-        self.bytes[..offset]
-            .iter()
-            .rposition(|&byte| byte == b'\n')
-            .map_or(0, |newline| newline + 1)
+        self.line_starts()[self.row_for_offset(offset)]
     }
 
     pub(crate) fn line_end(&self, offset: usize) -> usize {
-        let offset = offset.min(self.bytes.len());
-        let newline = self.bytes[offset..]
-            .iter()
-            .position(|&byte| byte == b'\n')
-            .map_or(self.bytes.len(), |newline| offset + newline);
-        if newline > offset && self.bytes.get(newline - 1) == Some(&b'\r') {
-            newline - 1
+        let row = self.row_for_offset(offset);
+        let end = self
+            .line_starts()
+            .get(row + 1)
+            .map_or(self.bytes.len(), |next_start| next_start - 1);
+        if end > 0 && self.bytes.get(end - 1) == Some(&b'\r') {
+            end - 1
         } else {
-            newline
+            end
         }
     }
 
@@ -216,24 +221,37 @@ impl Document {
     }
 
     pub(crate) fn line_start_by_row(&self, row: usize) -> Option<usize> {
-        if row == 0 {
-            return Some(0);
-        }
+        self.line_starts().get(row).copied()
+    }
 
-        let mut seen = 0;
-        for (offset, byte) in self.bytes.iter().enumerate() {
-            if *byte == b'\n' {
-                seen += 1;
-                if seen == row {
-                    return Some(offset + 1);
-                }
-            }
-        }
-        None
+    pub(crate) fn row_for_offset(&self, offset: usize) -> usize {
+        self.line_starts()
+            .partition_point(|&start| start <= offset.min(self.bytes.len()))
+            .saturating_sub(1)
     }
 
     pub(crate) fn restore(&mut self, bytes: Vec<u8>) {
         self.bytes = bytes;
+        self.invalidate_line_starts();
+    }
+
+    fn line_starts(&self) -> &[usize] {
+        self.line_starts.get_or_init(|| {
+            let mut starts =
+                Vec::with_capacity(self.bytes.iter().filter(|&&byte| byte == b'\n').count() + 1);
+            starts.push(0);
+            starts.extend(
+                self.bytes
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(offset, &byte)| (byte == b'\n').then_some(offset + 1)),
+            );
+            starts
+        })
+    }
+
+    fn invalidate_line_starts(&mut self) {
+        self.line_starts.take();
     }
 }
 
@@ -405,13 +423,26 @@ mod tests {
 
     #[test]
     fn exposes_text_lines() {
-        let document = Document::new(PathBuf::from("test.txt"), b"one\ntwo\n".to_vec());
+        let mut document = Document::new(PathBuf::from("test.txt"), b"one\ntwo\n".to_vec());
 
         assert_eq!(document.line_count(), 3);
         assert_eq!(document.line(0), Some(b"one".as_slice()));
         assert_eq!(document.line(1), Some(b"two".as_slice()));
         assert_eq!(document.line(2), Some(b"".as_slice()));
         assert_eq!(document.line(3), None);
+
+        document.insert_bytes(0, b"zero\n").unwrap();
+        assert_eq!(document.line_count(), 4);
+        assert_eq!(document.line(0), Some(b"zero".as_slice()));
+        assert_eq!(document.line(3), Some(b"".as_slice()));
+
+        document.delete_range(0..5).unwrap();
+        assert_eq!(document.line_count(), 3);
+        assert_eq!(document.line(0), Some(b"one".as_slice()));
+
+        document.restore(b"last".to_vec());
+        assert_eq!(document.line_count(), 1);
+        assert_eq!(document.line(0), Some(b"last".as_slice()));
     }
 
     #[test]

@@ -2,6 +2,12 @@
 
 use crate::{BufferId, Cursor};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectionKind {
+    Character,
+    Line,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ViewId(pub(crate) u64);
 
@@ -10,6 +16,7 @@ pub struct EditorView {
     pub(crate) buffer_id: BufferId,
     pub(crate) cursor: Cursor,
     pub(crate) preferred_column: Option<usize>,
+    pub(crate) selection_anchor: Option<usize>,
 }
 
 impl EditorView {
@@ -18,6 +25,7 @@ impl EditorView {
             buffer_id,
             cursor: Cursor::default(),
             preferred_column: None,
+            selection_anchor: None,
         }
     }
 
@@ -35,6 +43,10 @@ impl EditorView {
 
     pub fn preferred_column(&self) -> Option<usize> {
         self.preferred_column
+    }
+
+    pub fn selection_anchor(&self) -> Option<usize> {
+        self.selection_anchor
     }
 
     pub(crate) fn set_preferred_column(&mut self, column: Option<usize>) {
