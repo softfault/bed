@@ -35,6 +35,7 @@ impl TerminalSessionId {
 pub struct PollResult {
     pub output_events: usize,
     pub output_bytes: usize,
+    pub bells: usize,
     pub reached_eof: bool,
     pub exited: bool,
 }
@@ -155,6 +156,7 @@ impl TerminalSession {
 
     pub fn poll(&mut self) -> Result<PollResult> {
         let mut result = PollResult::default();
+        let bells_before = self.terminal.bell_count();
         while result.output_events < OUTPUT_EVENTS_PER_POLL {
             match self.output.try_recv() {
                 Ok(OutputEvent::Bytes(bytes)) => {
@@ -188,6 +190,7 @@ impl TerminalSession {
             self.input.take();
             result.exited = true;
         }
+        result.bells = self.terminal.bell_count().saturating_sub(bells_before);
         Ok(result)
     }
 

@@ -543,7 +543,12 @@ impl App {
         } else {
             "running".to_owned()
         };
-        let label = format!(" TERMINAL {} [{state}]", session.command());
+        let name = if session.title().is_empty() {
+            session.command()
+        } else {
+            session.title()
+        };
+        let label = format!(" TERMINAL {name} [{state}]");
         let mut label = render_text(label.as_bytes(), 0, area.columns);
         let used = display_width(&label);
         label.extend(std::iter::repeat_n(' ', area.columns.saturating_sub(used)));
@@ -740,8 +745,21 @@ impl App {
         if active_selection_cleared && self.mode == Mode::TerminalVisual {
             self.mode = Mode::TerminalNormal;
         }
-        for (id, _) in &activity {
+        for (id, result) in &activity {
+            if result.bells > 0 {
+                if !self.message.is_empty() {
+                    self.message.push_str("; ");
+                }
+                self.message
+                    .push_str(&format!("Terminal {} bell", id.get()));
+                if result.bells > 1 {
+                    self.message.push_str(&format!(" ({})", result.bells));
+                }
+            }
             if let Some(error) = self.terminals.get(*id).and_then(|session| session.error()) {
+                if !self.message.is_empty() {
+                    self.message.push_str("; ");
+                }
                 self.message
                     .push_str(&format!("Terminal {} failed: {error}", id.get()));
             }
@@ -3743,7 +3761,7 @@ mod tests {
     use super::{
         App, Command, DEFAULT_FILE_TREE_WIDTH, Mode, ParsedSubstitute, SplitAxis, TerminalPosition,
         TerminalSelection, anchored_terminal_scrollback, display_width, move_terminal_position,
-        parse_command, parse_substitute_expression, render_terminal_row,
+        parse_command, parse_substitute_expression, render_terminal_row, render_text,
         render_text_with_selection, sgr_attributes, shift_terminal_selection,
         terminal_selection_text,
     };
@@ -3981,6 +3999,7 @@ mod tests {
         });
         assert!(frame.windows(b"READY".len()).any(|bytes| bytes == b"READY"));
         assert!(frame.windows(5).any(|bytes| bytes == b"\x1b[31m"));
+        assert!(frame.windows(15).any(|bytes| bytes == b"TERMINAL printf"));
         assert!(frame.windows(7).any(|bytes| bytes == b"[exited"));
 
         app.close_active_window();
@@ -4000,6 +4019,49 @@ mod tests {
         execute(&mut app, &format!("terminalclose {}", session_id.get()));
         assert!(app.terminals.get(session_id).is_none());
         assert!(app.message.contains("closed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_title_and_bells_surface_child_feedback() {
+        use std::{
+            thread,
+            time::{Duration, Instant},
+        };
+
+        let mut app = app_with(b"");
+        execute(
+            &mut app,
+            "terminal printf '\\033]2;child title\\033\\\\\\007\\007READY'",
+        );
+        let session_id = app.active_terminal_session_id().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.terminals.get(session_id).is_some_and(|session| {
+            session.status().is_none()
+                || !session.reached_eof()
+                || !session.screen().contents().contains("READY")
+        }) {
+            app.poll_terminals().unwrap();
+            assert!(
+                Instant::now() < deadline,
+                "terminal feedback did not finish"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+
+        let frame = app.render(TerminalSize {
+            rows: 20,
+            columns: 80,
+        });
+        assert!(
+            frame
+                .windows(b"TERMINAL child title".len())
+                .any(|bytes| bytes == b"TERMINAL child title")
+        );
+        assert!(
+            app.message
+                .contains(&format!("Terminal {} bell", session_id.get()))
+        );
     }
 
     #[cfg(unix)]
@@ -5374,6 +5436,11 @@ mod tests {
             assert!(display_width(&app.status_line(columns, true)) <= columns);
             assert!(display_width(&app.status_line(columns, false)) <= columns);
         }
+    }
+
+    #[test]
+    fn rendered_text_replaces_terminal_control_characters() {
+        assert_eq!(render_text(b"safe\x1b[31m\n", 0, 20), "safe�[31m�");
     }
 
     #[test]

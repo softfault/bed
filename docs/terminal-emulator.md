@@ -60,6 +60,12 @@ new view, and `:terminalclose[!] ID` removes an unviewed session, optionally
 terminating a running process. This keeps process lifetime distinct from layout
 lifetime without leaving hidden sessions unmanaged.
 
+The terminal status line prefers a non-empty OSC title and otherwise shows the
+spawned command. Host rendering replaces control characters in titles rather
+than forwarding them to the outer terminal. BEL is surfaced as a concise bed
+message; several bells delivered in one poll are combined into a count instead
+of emitting an audible control byte or flooding the message area.
+
 ## Compatibility scope
 
 The first implementation covers sequences emitted by common shells and
@@ -72,9 +78,12 @@ interactive command-line programs:
 - OSC window titles terminated by BEL or ST.
 - Resize behavior for both screens, cursor, margins, wide cells, and scrollback.
 
-Unsupported sequences are ignored safely and counted for diagnostics. The
-initial implementation excludes sixel, ReGIS, printer control, Tektronix
-modes, and complete historical VT100 hardware emulation.
+Unsupported sequences are ignored safely and counted for diagnostics. The OSC
+payload buffer is limited to 4096 bytes. An oversized string is consumed
+through BEL or ST but rejected as a whole, so a truncated title is never
+applied and parsing resumes at the next byte. The initial implementation
+excludes sixel, ReGIS, printer control, Tektronix modes, and complete historical
+VT100 hardware emulation.
 
 ## Testing contract
 
@@ -85,6 +94,7 @@ modes, and complete historical VT100 hardware emulation.
 5. Application cursor, alternate screen, cursor visibility, mouse, and bracketed-paste modes transition independently.
 6. Expected screen states for shell and application transcripts live in this repository.
 7. Native PTY/ConPTY tests cover output, input, resize, exit, forced termination, and teardown on runtime-tested platforms.
+8. OSC title termination, size bounds, recovery, and BEL delivery are covered across emulator, session, and TUI boundaries.
 
 Arbitrary byte and resize streams should become fuzz targets after the core
 state model stabilizes.

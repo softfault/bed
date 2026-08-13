@@ -109,13 +109,39 @@ fn finalizes_incomplete_utf8_at_eof() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn reports_bells_from_each_poll() -> Result<()> {
+    let mut command = Command::new("/bin/sh");
+    command.args(["-c", "printf '\\007\\007ready'"]);
+    let mut session = TerminalSession::spawn(command, PtySize::new(2, 10)?, 0)?;
+    let mut bells = 0;
+
+    poll_until_with(&mut session, |session, result| {
+        bells += result.bells;
+        session.reached_eof() && session.status().is_some()
+    })?;
+
+    ensure!(bells == 2, "expected two bells, observed {bells}");
+    Ok(())
+}
+
 fn poll_until(
     session: &mut TerminalSession,
     mut ready: impl FnMut(&TerminalSession) -> bool,
 ) -> Result<()> {
+    poll_until_with(session, |session, _| ready(session))
+}
+
+fn poll_until_with(
+    session: &mut TerminalSession,
+    mut ready: impl FnMut(&TerminalSession, bed_terminal_session::PollResult) -> bool,
+) -> Result<()> {
     let deadline = Instant::now() + TIMEOUT;
-    while !ready(session) {
-        session.poll()?;
+    loop {
+        let result = session.poll()?;
+        if ready(session, result) {
+            return Ok(());
+        }
         if let Some(error) = session.error() {
             bail!("terminal session failed: {error}");
         }
@@ -129,5 +155,4 @@ fn poll_until(
         }
         thread::sleep(Duration::from_millis(2));
     }
-    Ok(())
 }

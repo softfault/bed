@@ -104,7 +104,8 @@ support it.
 `PtyProcess` exposes synchronous native handles. `bed-terminal-session` moves
 blocking reads and writes to dedicated threads connected through bounded
 channels. Its `poll` API keeps emulator mutation, generated-response routing,
-EOF finalization, process status, and UI-visible errors on the caller thread.
+EOF finalization, process status, bell deltas, and UI-visible errors on the
+caller thread.
 
 The embedded terminal under development for 0.4.0 uses `bed-vt100`, an
 independently written terminal emulator maintained in this workspace.
@@ -117,8 +118,11 @@ control character. Terminal Normal owns scrollback navigation and enters
 Terminal Input with `i`, `a`, or Enter; it deliberately does not promise Vim
 terminal-mode compatibility. Terminal Visual owns a view-local cell selection,
 preserves wide graphemes and soft wrapping when copying, and writes to bed's
-shared register. Terminal-emulation state stays separate from the native
-PTY/ConPTY process boundary and UI placement. Its compatibility scope and
+shared register. The window status prefers the child's bounded OSC title and
+falls back to the spawn command; control characters are replaced at the host
+rendering boundary. BEL becomes visible editor feedback rather than being
+forwarded to the host terminal. Terminal-emulation state stays separate from
+the native PTY/ConPTY process boundary and UI placement. Its compatibility scope and
 release gates are defined in
 [`docs/terminal-emulator.md`](docs/terminal-emulator.md).
 

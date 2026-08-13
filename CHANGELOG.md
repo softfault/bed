@@ -13,6 +13,8 @@ All notable changes to bed are documented in this file.
 - Terminal session listing, reattachment, and explicit process cleanup commands.
 - Cell-based terminal selection and register copying across scrollback, wide
   graphemes, and soft-wrapped rows.
+- Bounded child-title handling in terminal status lines and visible, coalesced
+  BEL feedback from embedded sessions.
 
 ## [0.3.0] - 2026-08-13
 

@@ -93,6 +93,10 @@ Terminal Visual mode:
 Terminal modes are intentionally bed-specific and do not promise Vim terminal
 compatibility.
 
+Each terminal split shows the child's OSC title when available and otherwise
+falls back to the spawned command. Child BEL events appear as a concise editor
+message instead of being sent to the outer terminal.
+
 Commands:
 
 - `:w`: save unless the file changed externally; `:w!` explicitly overwrites it

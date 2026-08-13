@@ -1,6 +1,7 @@
 use crate::screen::{Attributes, Color, Screen, TerminalModes};
 
 const ESC: u8 = 0x1b;
+const MAX_OSC_BYTES: usize = 4096;
 const REPLACEMENT_CHARACTER: char = '\u{fffd}';
 
 #[derive(Clone, Debug, Default)]
@@ -13,6 +14,7 @@ enum ParserState {
     Osc {
         bytes: Vec<u8>,
         escape: bool,
+        overflowed: bool,
     },
     IgnoreString {
         escape: bool,
@@ -166,32 +168,58 @@ impl TerminalEmulator {
             ParserState::Osc {
                 mut bytes,
                 mut escape,
+                mut overflowed,
             } => {
                 if matches!(byte, 0x18 | 0x1a) {
                     self.state = ParserState::Ground;
                 } else if escape {
                     if byte == b'\\' {
-                        self.dispatch_osc(&bytes);
+                        if overflowed {
+                            self.unsupported_sequences =
+                                self.unsupported_sequences.saturating_add(1);
+                        } else {
+                            self.dispatch_osc(&bytes);
+                        }
                         self.state = ParserState::Ground;
                     } else {
-                        if bytes.len() < 4096 {
+                        if bytes.len().saturating_add(2) <= MAX_OSC_BYTES {
                             bytes.push(ESC);
                             bytes.push(byte);
+                        } else {
+                            overflowed = true;
                         }
                         escape = false;
-                        self.state = ParserState::Osc { bytes, escape };
+                        self.state = ParserState::Osc {
+                            bytes,
+                            escape,
+                            overflowed,
+                        };
                     }
                 } else if byte == 0x07 {
-                    self.dispatch_osc(&bytes);
+                    if overflowed {
+                        self.unsupported_sequences = self.unsupported_sequences.saturating_add(1);
+                    } else {
+                        self.dispatch_osc(&bytes);
+                    }
                     self.state = ParserState::Ground;
                 } else if byte == ESC {
                     escape = true;
-                    self.state = ParserState::Osc { bytes, escape };
+                    self.state = ParserState::Osc {
+                        bytes,
+                        escape,
+                        overflowed,
+                    };
                 } else {
-                    if bytes.len() < 4096 {
+                    if bytes.len() < MAX_OSC_BYTES {
                         bytes.push(byte);
+                    } else {
+                        overflowed = true;
                     }
-                    self.state = ParserState::Osc { bytes, escape };
+                    self.state = ParserState::Osc {
+                        bytes,
+                        escape,
+                        overflowed,
+                    };
                 }
             }
             ParserState::IgnoreString { mut escape } => {
@@ -229,6 +257,7 @@ impl TerminalEmulator {
                 self.state = ParserState::Osc {
                     bytes: Vec::new(),
                     escape: false,
+                    overflowed: false,
                 };
             }
             b'P' | b'^' | b'_' => {
@@ -655,7 +684,7 @@ fn apply_extended_color(parameters: &[Option<u16>], color: &mut Color) -> usize 
 
 #[cfg(test)]
 mod tests {
-    use super::TerminalEmulator;
+    use super::{MAX_OSC_BYTES, TerminalEmulator};
     use crate::{Color, Screen, TerminalModes};
 
     #[test]
@@ -746,6 +775,35 @@ mod tests {
         assert_eq!(attributes.foreground, Color::Indexed(200));
         assert_eq!(attributes.background, Color::Rgb(1, 2, 3));
         assert_eq!(terminal.take_responses(), b"\x1b[1;2R");
+    }
+
+    #[test]
+    fn accepts_bel_and_st_terminated_titles() {
+        let mut terminal = TerminalEmulator::new(2, 20, 0);
+        terminal.process(b"\x1b]0;first\x07");
+        assert_eq!(terminal.title(), "first");
+
+        terminal.process(b"\x1b]2;second\x1b\\");
+        assert_eq!(terminal.title(), "second");
+        assert_eq!(terminal.bell_count(), 0);
+    }
+
+    #[test]
+    fn rejects_oversized_osc_and_recovers_after_its_terminator() {
+        let mut terminal = TerminalEmulator::new(2, 20, 0);
+        terminal.process(b"\x1b]2;kept\x07");
+
+        let mut oversized = b"\x1b]2;".to_vec();
+        oversized.extend(std::iter::repeat_n(b'x', MAX_OSC_BYTES));
+        oversized.extend_from_slice(b"\x1b\\OK");
+        terminal.process(&oversized);
+
+        assert_eq!(terminal.title(), "kept");
+        assert!(terminal.screen().contents().contains("OK"));
+        assert_eq!(terminal.unsupported_sequence_count(), 1);
+
+        terminal.process(b"\x1b]2;recovered\x07");
+        assert_eq!(terminal.title(), "recovered");
     }
 
     #[test]
