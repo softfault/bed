@@ -175,6 +175,87 @@ fn routes_mode_aware_mouse_input() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn readline_redraws_unicode_history_without_corrupting_the_screen() -> Result<()> {
+    let mut command = Command::new("/bin/bash");
+    command
+        .args(["--noprofile", "--norc", "-i"])
+        .env("PS1", "BED> ");
+    let mut session = TerminalSession::spawn(command, PtySize::new(8, 100)?, 0)?;
+    poll_until(&mut session, |session| {
+        session.screen().contents().contains("BED>")
+    })?;
+
+    let command = "printf '中文 👩🏽‍💻 combining: e\\u0301\\n'";
+    session.send_bytes(format!("{command}\n").into_bytes())?;
+    poll_until(&mut session, |session| {
+        session.screen().contents().matches("BED>").count() >= 2
+            && session.screen().contents().contains("combining: é")
+    })?;
+
+    session.send_key(&Key::ArrowUp)?;
+    let recalled_line = format!("BED> {command}");
+    let recalled_column = unicode_width::UnicodeWidthStr::width(recalled_line.as_str());
+    poll_until(&mut session, |session| {
+        session
+            .screen()
+            .rows()
+            .iter()
+            .any(|row| row.text() == recalled_line)
+            && session.screen().cursor().column == recalled_column
+    })?;
+    let recalled_cursor = session.screen().cursor();
+    for _ in 0..24 {
+        session.send_key(&Key::ArrowLeft)?;
+        poll_until_with(&mut session, |_, result| result.output_bytes > 0)?;
+    }
+    for _ in 0..24 {
+        session.send_key(&Key::ArrowRight)?;
+        poll_until_with(&mut session, |_, result| result.output_bytes > 0)?;
+    }
+    ensure!(
+        session.screen().cursor() == recalled_cursor,
+        "readline cursor did not return after symmetric Unicode movement: start={recalled_cursor:?}, end={:?}",
+        session.screen().cursor()
+    );
+    session.send_key(&Key::ArrowDown)?;
+    poll_until_with(&mut session, |_, result| result.output_bytes > 0)?;
+    poll_until(&mut session, |session| {
+        session
+            .screen()
+            .rows()
+            .iter()
+            .any(|row| row.text() == "BED>")
+    })?;
+
+    for row in session.screen().rows() {
+        for (column, cell) in row.cells().iter().enumerate() {
+            if cell.is_continuation() {
+                ensure!(column > 0, "continuation at the start of a row");
+                ensure!(
+                    unicode_width::UnicodeWidthStr::width(row.cells()[column - 1].contents()) == 2,
+                    "orphan continuation in row {:?}",
+                    row.text()
+                );
+            }
+        }
+    }
+    ensure!(
+        session
+            .screen()
+            .rows()
+            .iter()
+            .any(|row| row.text() == "BED>"),
+        "readline left stale cells after clearing history: {:?}",
+        session.screen().contents()
+    );
+    session.send_bytes(b"exit\n".to_vec())?;
+    poll_until(&mut session, |session| {
+        session.reached_eof() && session.status().is_some()
+    })?;
+    Ok(())
+}
+
 fn poll_until(
     session: &mut TerminalSession,
     mut ready: impl FnMut(&TerminalSession) -> bool,

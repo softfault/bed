@@ -15,3 +15,6 @@ anyhow.workspace = true
 bed-pty.workspace = true
 bed-terminal.workspace = true
 bed-vt100.workspace = true
+
+[dev-dependencies]
+unicode-width.workspace = true

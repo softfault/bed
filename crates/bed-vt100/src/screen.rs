@@ -441,9 +441,6 @@ impl Screen {
 
     pub(crate) fn backspace(&mut self) {
         self.cursor.column = self.cursor.column.saturating_sub(1);
-        if self.rows[self.cursor.row].cells[self.cursor.column].continuation {
-            self.cursor.column = self.cursor.column.saturating_sub(1);
-        }
         self.cursor.pending_wrap = false;
     }
 

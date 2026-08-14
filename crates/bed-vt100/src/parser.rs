@@ -780,6 +780,20 @@ mod tests {
     }
 
     #[test]
+    fn backspace_moves_one_terminal_column_across_a_wide_cell() {
+        let mut terminal = TerminalEmulator::new(2, 8, 0);
+        terminal.process("好".as_bytes());
+
+        terminal.process(b"\x08");
+        assert_eq!(terminal.screen().cursor().column, 1);
+        assert!(terminal.screen().cell(0, 1).unwrap().is_continuation());
+
+        terminal.process(b"\x08");
+        assert_eq!(terminal.screen().cursor().column, 0);
+        assert_eq!(terminal.screen().row(0).unwrap().text(), "好");
+    }
+
+    #[test]
     fn bounds_primary_scrollback_and_keeps_alternate_output_separate() {
         let mut terminal = TerminalEmulator::new(2, 8, 2);
         terminal.process(b"one\r\ntwo\r\nthree\r\nfour");

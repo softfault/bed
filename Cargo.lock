@@ -69,6 +69,7 @@ dependencies = [
  "bed-pty",
  "bed-terminal",
  "bed-vt100",
+ "unicode-width",
 ]
 
 [[package]]
