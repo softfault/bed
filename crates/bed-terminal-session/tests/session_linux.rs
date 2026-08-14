@@ -14,6 +14,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+use unicode_width::UnicodeWidthChar;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -195,7 +196,7 @@ fn readline_redraws_unicode_history_without_corrupting_the_screen() -> Result<()
 
     session.send_key(&Key::ArrowUp)?;
     let recalled_line = format!("BED> {command}");
-    let recalled_column = unicode_width::UnicodeWidthStr::width(recalled_line.as_str());
+    let recalled_column = terminal_width(&recalled_line);
     poll_until(&mut session, |session| {
         session
             .screen()
@@ -254,6 +255,92 @@ fn readline_redraws_unicode_history_without_corrupting_the_screen() -> Result<()
         session.reached_eof() && session.status().is_some()
     })?;
     Ok(())
+}
+
+#[test]
+fn readline_bracketed_paste_keeps_unicode_input_after_the_prompt() -> Result<()> {
+    let mut command = Command::new("/bin/bash");
+    command
+        .args(["--noprofile", "--norc", "-i"])
+        .env("PS1", "BED> ");
+    let mut session = TerminalSession::spawn(command, PtySize::new(8, 100)?, 0)?;
+    poll_until(&mut session, |session| {
+        session.modes().bracketed_paste
+            && session
+                .screen()
+                .rows()
+                .iter()
+                .any(|row| row.text() == "BED>")
+    })?;
+
+    let prefix = "printf '";
+    session.send_bytes(prefix.as_bytes().to_vec())?;
+    let input = "中文 👩🏽‍💻 combining: e\\u0301\\n";
+    session.send_key(&Key::Paste(input.to_owned()))?;
+    let expected = format!("BED> {prefix}{input}");
+    let expected_column = terminal_width(&expected);
+    poll_until(&mut session, |session| {
+        session
+            .screen()
+            .rows()
+            .iter()
+            .any(|row| row.text() == expected)
+    })?;
+    ensure!(
+        session.screen().cursor().column == expected_column,
+        "bracketed paste left the terminal cursor out of sync: expected={expected_column}, actual={:?}, screen={:?}",
+        session.screen().cursor(),
+        session.screen().contents()
+    );
+
+    for _ in 0..input.chars().count() + prefix.chars().count() {
+        session.send_key(&Key::Backspace)?;
+        poll_until_with(&mut session, |_, result| result.output_bytes > 0)?;
+        ensure!(
+            session
+                .screen()
+                .rows()
+                .iter()
+                .any(|row| row.text().starts_with("BED>")),
+            "readline backspace damaged the prompt: {:?}",
+            session.screen().contents()
+        );
+    }
+    ensure!(
+        session
+            .screen()
+            .rows()
+            .iter()
+            .any(|row| row.text() == "BED>"),
+        "readline did not erase the pasted input cleanly: {:?}",
+        session.screen().contents()
+    );
+    let empty_cursor = session.screen().cursor();
+    session.send_key(&Key::Backspace)?;
+    poll_until_with(&mut session, |_, result| result.output_bytes > 0)?;
+    ensure!(
+        session.screen().cursor() == empty_cursor
+            && session
+                .screen()
+                .rows()
+                .iter()
+                .any(|row| row.text() == "BED>"),
+        "readline backspace moved before an empty prompt: cursor={:?}, screen={:?}",
+        session.screen().cursor(),
+        session.screen().contents()
+    );
+
+    session.send_bytes(b"exit\n".to_vec())?;
+    poll_until(&mut session, |session| {
+        session.reached_eof() && session.status().is_some()
+    })?;
+    Ok(())
+}
+
+fn terminal_width(text: &str) -> usize {
+    text.chars()
+        .map(|character| character.width().unwrap_or(1))
+        .sum()
 }
 
 fn poll_until(

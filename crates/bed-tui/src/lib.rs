@@ -694,6 +694,10 @@ impl App {
                 .scrollback()
                 .len()
                 .saturating_sub(view.scrollback);
+            let display_column = terminal_row(session.screen(), cursor.row)
+                .map_or(cursor.column, |row| {
+                    terminal_display_column(row, cursor.column)
+                });
             return (
                 area.row
                     + cursor
@@ -701,13 +705,19 @@ impl App {
                         .saturating_sub(visible_start)
                         .min(area.rows.saturating_sub(2))
                     + 1,
-                area.column + cursor.column.min(area.columns.saturating_sub(1)) + 1,
+                area.column + display_column.min(area.columns.saturating_sub(1)) + 1,
             );
         }
         let cursor = session.screen().cursor();
+        let display_column = session
+            .screen()
+            .row(cursor.row)
+            .map_or(cursor.column, |row| {
+                terminal_display_column(row, cursor.column)
+            });
         (
             area.row + cursor.row.min(area.rows.saturating_sub(2)) + 1,
-            area.column + cursor.column.min(area.columns.saturating_sub(1)) + 1,
+            area.column + display_column.min(area.columns.saturating_sub(1)) + 1,
         )
     }
 
@@ -3786,6 +3796,7 @@ fn render_terminal_row(
     selection: Option<(usize, TerminalSelectionBounds)>,
 ) {
     let mut used = 0;
+    let mut rendered = String::new();
     let mut attributes = None;
     for (column, cell) in row.cells().iter().enumerate() {
         if cell.is_continuation() || used >= columns {
@@ -3807,9 +3818,81 @@ fn render_terminal_row(
             attributes = Some(next);
         }
         output.extend_from_slice(cell.contents().as_bytes());
+        rendered.push_str(cell.contents());
         used += width;
     }
     output.extend_from_slice(RESET_STYLE);
+    let display_used = UnicodeWidthStr::width(rendered.as_str()).min(columns);
+    output.extend(std::iter::repeat_n(
+        b' ',
+        columns.saturating_sub(display_used),
+    ));
+}
+
+fn terminal_display_column(row: &Row, column: usize) -> usize {
+    let column = column.min(row.cells().len());
+    if column < row.cells().len() && row.cells()[column].is_continuation() {
+        let mut text = String::new();
+        for cell in &row.cells()[..column.saturating_sub(1)] {
+            if !cell.is_continuation() {
+                text.push_str(cell.contents());
+            }
+        }
+        return UnicodeWidthStr::width(text.as_str()).saturating_add(1);
+    }
+
+    let mut text = String::new();
+    for cell in &row.cells()[..column] {
+        if !cell.is_continuation() {
+            text.push_str(cell.contents());
+        }
+    }
+    UnicodeWidthStr::width(text.as_str())
+}
+
+#[derive(Clone, Copy)]
+struct TerminalGraphemeSpan {
+    start: usize,
+    end: usize,
+    blank: bool,
+}
+
+fn terminal_grapheme_spans(row: &Row) -> Vec<TerminalGraphemeSpan> {
+    let mut text = String::new();
+    let mut byte_columns = Vec::new();
+    for (column, cell) in row.cells().iter().enumerate() {
+        if cell.is_continuation() {
+            continue;
+        }
+        text.push_str(cell.contents());
+        byte_columns.extend(std::iter::repeat_n(column, cell.contents().len()));
+    }
+
+    text.grapheme_indices(true)
+        .map(|(offset, grapheme)| {
+            let start = byte_columns[offset];
+            let last = byte_columns[offset + grapheme.len() - 1];
+            let end = if last + 1 < row.cells().len() && row.cells()[last + 1].is_continuation() {
+                last + 1
+            } else {
+                last
+            };
+            TerminalGraphemeSpan {
+                start,
+                end,
+                blank: grapheme == " ",
+            }
+        })
+        .collect()
+}
+
+fn terminal_grapheme_span(row: &Row, column: usize) -> Option<TerminalGraphemeSpan> {
+    let spans = terminal_grapheme_spans(row);
+    spans
+        .iter()
+        .copied()
+        .find(|span| (span.start..=span.end).contains(&column))
+        .or_else(|| spans.into_iter().rev().find(|span| span.start <= column))
 }
 
 fn terminal_row(screen: &Screen, row: usize) -> Option<&Row> {
@@ -3822,9 +3905,10 @@ fn terminal_row(screen: &Screen, row: usize) -> Option<&Row> {
 }
 
 fn last_terminal_column(row: &Row) -> usize {
-    row.cells()
-        .iter()
-        .rposition(|cell| !cell.is_continuation() && cell.contents() != " ")
+    terminal_grapheme_spans(row)
+        .into_iter()
+        .rfind(|span| !span.blank)
+        .map(|span| span.start)
         .unwrap_or(0)
 }
 
@@ -3841,8 +3925,8 @@ fn normalize_terminal_position(
         return TerminalPosition::default();
     };
     position.column = position.column.min(row.cells().len().saturating_sub(1));
-    while position.column > 0 && row.cells()[position.column].is_continuation() {
-        position.column -= 1;
+    if let Some(span) = terminal_grapheme_span(row, position.column) {
+        position.column = span.start;
     }
     position
 }
@@ -3875,19 +3959,21 @@ fn move_terminal_position(
     let Some(target) = terminal_row(screen, row) else {
         return position;
     };
-    let mut column = position
-        .column
-        .saturating_add_signed(columns)
-        .min(target.cells().len().saturating_sub(1));
-    if columns > 0 {
-        while column + 1 < target.cells().len() && target.cells()[column].is_continuation() {
-            column += 1;
-        }
+    let spans = terminal_grapheme_spans(target);
+    let current = position.column.min(target.cells().len().saturating_sub(1));
+    let current_index = spans
+        .iter()
+        .position(|span| (span.start..=span.end).contains(&current))
+        .or_else(|| spans.iter().rposition(|span| span.start <= current))
+        .unwrap_or(0);
+    let column = if columns == 0 {
+        spans.get(current_index).map_or(0, |span| span.start)
     } else {
-        while column > 0 && target.cells()[column].is_continuation() {
-            column -= 1;
-        }
-    }
+        let index = current_index
+            .saturating_add_signed(columns)
+            .min(spans.len().saturating_sub(1));
+        spans.get(index).map_or(0, |span| span.start)
+    };
     TerminalPosition { row, column }
 }
 
@@ -3915,6 +4001,17 @@ fn terminal_selection_bounds(
         }
         start.column = 0;
         end.column = usize::MAX;
+    } else {
+        if let Some(row) = terminal_row(screen, start.row)
+            && let Some(span) = terminal_grapheme_span(row, start.column)
+        {
+            start.column = span.start;
+        }
+        if let Some(row) = terminal_row(screen, end.row)
+            && let Some(span) = terminal_grapheme_span(row, end.column)
+        {
+            end.column = span.end;
+        }
     }
     TerminalSelectionBounds { start, end }
 }
@@ -4057,7 +4154,8 @@ mod tests {
         TerminalSelection, anchored_terminal_scrollback, display_width, move_terminal_position,
         parse_command, parse_substitute_expression, render_terminal_row, render_text,
         render_text_with_selection, sgr_attributes, shift_terminal_selection,
-        terminal_live_position, terminal_selection_bounds, terminal_selection_text,
+        terminal_display_column, terminal_live_position, terminal_selection_bounds,
+        terminal_selection_text,
     };
     use bed_core::{Document, Editor, SelectionKind, SubstituteOptions, SubstituteRange};
     use bed_terminal::{Key, TerminalSize};
@@ -6136,6 +6234,34 @@ mod tests {
         let frame = String::from_utf8(frame).unwrap();
 
         assert!(frame.ends_with("\x1b[2;5H\x1b[2 q\x1b[?25h"));
+    }
+
+    #[test]
+    fn projects_terminal_scalar_cells_onto_rendered_grapheme_columns() {
+        let mut terminal = TerminalEmulator::new(2, 20, 0);
+        terminal.process("a👩🏽‍💻x".as_bytes());
+        let row = terminal.screen().row(0).unwrap();
+
+        assert_eq!(terminal.screen().cursor().column, 8);
+        assert_eq!(terminal_display_column(row, 8), 4);
+        assert_eq!(terminal_display_column(row, 2), 2);
+
+        let after_text = TerminalPosition { row: 0, column: 8 };
+        let on_x = move_terminal_position(terminal.screen(), after_text, 0, -1);
+        let on_emoji = move_terminal_position(terminal.screen(), on_x, 0, -1);
+        assert_eq!(on_x.column, 7);
+        assert_eq!(on_emoji.column, 1);
+        assert_eq!(
+            terminal_selection_text(
+                terminal.screen(),
+                TerminalSelection {
+                    anchor: on_emoji,
+                    cursor: on_emoji,
+                    kind: SelectionKind::Character,
+                }
+            ),
+            "👩🏽‍💻"
+        );
     }
 
     #[test]

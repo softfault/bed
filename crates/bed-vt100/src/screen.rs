@@ -1,6 +1,5 @@
 use std::collections::VecDeque;
-use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Color {
@@ -330,12 +329,13 @@ impl Screen {
     }
 
     pub(crate) fn put_char(&mut self, character: char, modes: TerminalModes) {
-        if self.try_extend_previous_grapheme(character) {
-            return;
-        }
         let mut contents = character.to_string();
-        let mut width = display_width(&contents);
+        let mut width = character.width().unwrap_or(1);
         if width == 0 {
+            if let Some((row, column)) = self.previous_leading_cell() {
+                self.rows[row].cells[column].contents.push(character);
+                return;
+            }
             contents.insert(0, ' ');
             width = 1;
         }
@@ -376,37 +376,6 @@ impl Screen {
         }
     }
 
-    fn try_extend_previous_grapheme(&mut self, character: char) -> bool {
-        let Some((row, column)) = self.previous_leading_cell() else {
-            return false;
-        };
-        let previous = self.rows[row].cells[column].contents.clone();
-        if previous == " " {
-            return false;
-        }
-        let mut combined = previous.clone();
-        combined.push(character);
-        if combined.graphemes(true).count() != 1 {
-            return false;
-        }
-        let old_width = display_width(&previous).clamp(1, 2);
-        let new_width = display_width(&combined).clamp(1, 2);
-        let columns = self.size().1;
-        if new_width == 2 && column + 1 >= columns {
-            return false;
-        }
-        self.rows[row].cells[column].contents = combined;
-        if old_width == 2 && new_width == 1 && column + 1 < columns {
-            self.rows[row].cells[column + 1] = Cell::default();
-            self.rewind_cursor_after_width_change(1);
-        } else if old_width == 1 && new_width == 2 {
-            let attributes = self.rows[row].cells[column].attributes;
-            self.rows[row].cells[column + 1] = Cell::continuation(attributes);
-            self.advance_cursor_after_width_change(1);
-        }
-        true
-    }
-
     fn previous_leading_cell(&self) -> Option<(usize, usize)> {
         let (row, mut column) = if self.cursor.pending_wrap {
             (self.cursor.row, self.size().1 - 1)
@@ -419,24 +388,6 @@ impl Screen {
             column = column.checked_sub(1)?;
         }
         Some((row, column))
-    }
-
-    fn rewind_cursor_after_width_change(&mut self, amount: usize) {
-        if self.cursor.pending_wrap {
-            self.cursor.pending_wrap = false;
-        } else {
-            self.cursor.column = self.cursor.column.saturating_sub(amount);
-        }
-    }
-
-    fn advance_cursor_after_width_change(&mut self, amount: usize) {
-        let columns = self.size().1;
-        if self.cursor.pending_wrap || self.cursor.column + amount >= columns {
-            self.cursor.column = columns - 1;
-            self.cursor.pending_wrap = true;
-        } else {
-            self.cursor.column += amount;
-        }
     }
 
     pub(crate) fn backspace(&mut self) {
@@ -677,7 +628,10 @@ impl Screen {
 
     fn clear_wide_cell_at(&mut self, row: usize, column: usize) {
         if self.rows[row].cells[column].continuation {
-            if column > 0 {
+            if column > 0
+                && !self.rows[row].cells[column - 1].continuation
+                && display_width(&self.rows[row].cells[column - 1].contents) == 2
+            {
                 self.rows[row].cells[column - 1] = Cell::blank(self.attributes);
             }
         } else if display_width(&self.rows[row].cells[column].contents) == 2

@@ -11,5 +11,4 @@ readme.workspace = true
 description = "Terminal-emulation state and incremental VT parser for bed"
 
 [dependencies]
-unicode-segmentation.workspace = true
 unicode-width.workspace = true

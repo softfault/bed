@@ -767,16 +767,20 @@ mod tests {
     }
 
     #[test]
-    fn stores_graphemes_and_wide_continuation_cells() {
-        let mut terminal = TerminalEmulator::new(2, 8, 0);
+    fn stores_scalar_widths_and_wide_continuation_cells() {
+        let mut terminal = TerminalEmulator::new(2, 12, 0);
         terminal.process("a👩🏽‍💻好".as_bytes());
 
         assert_eq!(terminal.screen().cell(0, 0).unwrap().contents(), "a");
-        assert_eq!(terminal.screen().cell(0, 1).unwrap().contents(), "👩🏽‍💻");
+        assert_eq!(terminal.screen().cell(0, 1).unwrap().contents(), "👩");
         assert!(terminal.screen().cell(0, 2).unwrap().is_continuation());
-        assert_eq!(terminal.screen().cell(0, 3).unwrap().contents(), "好");
+        assert_eq!(terminal.screen().cell(0, 3).unwrap().contents(), "🏽‍");
         assert!(terminal.screen().cell(0, 4).unwrap().is_continuation());
-        assert_eq!(terminal.screen().cursor().column, 5);
+        assert_eq!(terminal.screen().cell(0, 5).unwrap().contents(), "💻");
+        assert!(terminal.screen().cell(0, 6).unwrap().is_continuation());
+        assert_eq!(terminal.screen().cell(0, 7).unwrap().contents(), "好");
+        assert!(terminal.screen().cell(0, 8).unwrap().is_continuation());
+        assert_eq!(terminal.screen().cursor().column, 9);
     }
 
     #[test]
@@ -791,6 +795,23 @@ mod tests {
         terminal.process(b"\x08");
         assert_eq!(terminal.screen().cursor().column, 0);
         assert_eq!(terminal.screen().row(0).unwrap().text(), "好");
+    }
+
+    #[test]
+    fn overwrites_wide_cells_after_readline_deletes_a_column() {
+        let prefix = "BED> printf '";
+        let input = "中文 👩🏽‍💻 combining: e\\u0301\\n";
+        let mut terminal = TerminalEmulator::new(2, 100, 0);
+        terminal.process(format!("{prefix}{input}").as_bytes());
+
+        terminal.process(b"\r\x1b[13C\x1b[P");
+        terminal.process("中文 👩🏽‍💻 combining: e\\u0301\\".as_bytes());
+
+        assert_eq!(
+            terminal.screen().row(0).unwrap().text(),
+            format!("{prefix}中文 👩🏽‍💻 combining: e\\u0301\\")
+        );
+        assert_grid_invariants(terminal.screen());
     }
 
     #[test]
