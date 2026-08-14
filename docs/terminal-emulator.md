@@ -52,11 +52,13 @@ area are translated into child coordinates and filtered by the child's
 release, drag, motion, wheel, and modifier information. Status rows, other
 windows, scrolled-back views, and bed-owned modes do not forward mouse input.
 
-`v` enters Terminal Visual, whose selection belongs to the view rather than the
-session. Cell motions account for wide graphemes, `y` copies into bed's shared
-register, and soft-wrapped rows are joined without an inserted newline. The
-selection remains anchored while output advances and is clamped when bounded
-history evicts its oldest rows.
+`v` enters cell-based Terminal Visual and `V` enters logical-line Terminal
+Visual. The active key cancels its selection, while the other key switches the
+selection kind. Cell motions account for wide graphemes. Logical-line bounds
+expand across soft-wrapped rows, so `y` writes a linewise bed register without
+introducing display-only newlines. Selections belong to the view rather than
+the session, remain anchored while output advances, and are clamped when
+bounded history evicts its oldest rows.
 
 Several views may refer to one running session, but only the focused view owns
 its PTY dimensions. A view scrolled into history remains anchored as output

@@ -173,6 +173,13 @@ struct TerminalPosition {
 struct TerminalSelection {
     anchor: TerminalPosition,
     cursor: TerminalPosition,
+    kind: SelectionKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TerminalSelectionBounds {
+    start: TerminalPosition,
+    end: TerminalPosition,
 }
 
 #[derive(Debug)]
@@ -605,7 +612,8 @@ impl App {
         let selection = (self.active_terminal_view_id() == Some(view_id)
             && self.mode == Mode::TerminalVisual)
             .then_some(view.selection)
-            .flatten();
+            .flatten()
+            .map(|selection| terminal_selection_bounds(screen, selection));
         let rows = history
             .iter()
             .skip(visible_start)
@@ -636,7 +644,24 @@ impl App {
         } else {
             session.title()
         };
-        let label = format!(" TERMINAL {name} [{state}]");
+        let mode = if self.active_terminal_view_id() == Some(view_id) {
+            match self.mode {
+                Mode::TerminalInput => "TERMINAL INPUT",
+                Mode::TerminalNormal => "TERMINAL NORMAL",
+                Mode::TerminalVisual
+                    if view
+                        .selection
+                        .is_some_and(|selection| selection.kind == SelectionKind::Line) =>
+                {
+                    "TERMINAL VISUAL LINE"
+                }
+                Mode::TerminalVisual => "TERMINAL VISUAL",
+                _ => "TERMINAL",
+            }
+        } else {
+            "TERMINAL"
+        };
+        let label = format!(" {mode} {name} [{state}]");
         let mut label = render_text(label.as_bytes(), 0, area.columns);
         let used = display_width(&label);
         label.extend(std::iter::repeat_n(' ', area.columns.saturating_sub(used)));
@@ -1091,13 +1116,14 @@ impl App {
                 );
             }
             Key::Char('G') | Key::End => self.move_terminal_cursor_to_live(),
-            Key::Char('v') => self.enter_terminal_visual(),
+            Key::Char('v') => self.enter_terminal_visual(SelectionKind::Character),
+            Key::Char('V') => self.enter_terminal_visual(SelectionKind::Line),
             Key::Escape => {}
             _ => self.message.push_str("Invalid Terminal Normal command"),
         }
     }
 
-    fn enter_terminal_visual(&mut self) {
+    fn enter_terminal_visual(&mut self, kind: SelectionKind) {
         let Some(view_id) = self.active_terminal_view_id() else {
             return;
         };
@@ -1114,13 +1140,16 @@ impl App {
             .selection = Some(TerminalSelection {
             anchor: position,
             cursor: position,
+            kind,
         });
         self.mode = Mode::TerminalVisual;
     }
 
     fn handle_terminal_visual_key(&mut self, key: Key) {
         match key {
-            Key::Escape | Key::Ctrl('c') | Key::Char('v') => self.leave_terminal_visual(),
+            Key::Escape | Key::Ctrl('c') => self.leave_terminal_visual(),
+            Key::Char('v') => self.toggle_terminal_selection_kind(SelectionKind::Character),
+            Key::Char('V') => self.toggle_terminal_selection_kind(SelectionKind::Line),
             Key::Char('h') | Key::ArrowLeft => self.move_terminal_selection(0, -1),
             Key::Char('l') | Key::ArrowRight => self.move_terminal_selection(0, 1),
             Key::Char('j') | Key::ArrowDown => self.move_terminal_selection(1, 0),
@@ -1129,6 +1158,28 @@ impl App {
             Key::Char('$') | Key::End => self.move_terminal_selection_to_edge(true),
             Key::Char('y') => self.yank_terminal_selection(),
             _ => self.message.push_str("Invalid Terminal Visual command"),
+        }
+    }
+
+    fn toggle_terminal_selection_kind(&mut self, kind: SelectionKind) {
+        let Some(view_id) = self.active_terminal_view_id() else {
+            return;
+        };
+        let Some(selection) = self
+            .terminal_views
+            .get(&view_id)
+            .and_then(|view| view.selection)
+        else {
+            return;
+        };
+        if selection.kind == kind {
+            self.leave_terminal_visual();
+        } else if let Some(selection) = self
+            .terminal_views
+            .get_mut(&view_id)
+            .and_then(|view| view.selection.as_mut())
+        {
+            selection.kind = kind;
         }
     }
 
@@ -1224,9 +1275,15 @@ impl App {
             return;
         };
         let bytes = terminal_selection_text(session.screen(), selection).into_bytes();
-        self.register = Some(Register::Character(bytes));
+        self.register = Some(match selection.kind {
+            SelectionKind::Character => Register::Character(bytes),
+            SelectionKind::Line => Register::Line(bytes),
+        });
         self.leave_terminal_visual();
-        self.message.push_str("Terminal text yanked");
+        self.message.push_str(match selection.kind {
+            SelectionKind::Character => "Terminal text yanked",
+            SelectionKind::Line => "Terminal lines yanked",
+        });
     }
 
     fn handle_normal_key(&mut self, key: Key) -> Result<()> {
@@ -3726,7 +3783,7 @@ fn render_terminal_row(
     output: &mut Vec<u8>,
     row: &Row,
     columns: usize,
-    selection: Option<(usize, TerminalSelection)>,
+    selection: Option<(usize, TerminalSelectionBounds)>,
 ) {
     let mut used = 0;
     let mut attributes = None;
@@ -3834,12 +3891,32 @@ fn move_terminal_position(
     TerminalPosition { row, column }
 }
 
-fn terminal_selection_bounds(selection: TerminalSelection) -> (TerminalPosition, TerminalPosition) {
-    if selection.anchor <= selection.cursor {
+fn terminal_selection_bounds(
+    screen: &Screen,
+    selection: TerminalSelection,
+) -> TerminalSelectionBounds {
+    let (mut start, mut end) = if selection.anchor <= selection.cursor {
         (selection.anchor, selection.cursor)
     } else {
         (selection.cursor, selection.anchor)
+    };
+    if selection.kind == SelectionKind::Line {
+        while start.row > 0 && terminal_row(screen, start.row - 1).is_some_and(Row::wrapped) {
+            start.row -= 1;
+        }
+        let row_count = screen
+            .scrollback()
+            .len()
+            .saturating_add(screen.rows().len());
+        while end.row.saturating_add(1) < row_count
+            && terminal_row(screen, end.row).is_some_and(Row::wrapped)
+        {
+            end.row += 1;
+        }
+        start.column = 0;
+        end.column = usize::MAX;
     }
+    TerminalSelectionBounds { start, end }
 }
 
 fn shift_terminal_selection(
@@ -3858,17 +3935,16 @@ fn terminal_cell_selected(
     row: usize,
     column: usize,
     width: usize,
-    selection: TerminalSelection,
+    selection: TerminalSelectionBounds,
 ) -> bool {
-    let (start, end) = terminal_selection_bounds(selection);
     let cell_end = column.saturating_add(width.saturating_sub(1));
-    (row > start.row || cell_end >= start.column)
-        && (row < end.row || column <= end.column)
-        && (start.row..=end.row).contains(&row)
+    (row > selection.start.row || cell_end >= selection.start.column)
+        && (row < selection.end.row || column <= selection.end.column)
+        && (selection.start.row..=selection.end.row).contains(&row)
 }
 
 fn terminal_selection_text(screen: &Screen, selection: TerminalSelection) -> String {
-    let (start, end) = terminal_selection_bounds(selection);
+    let TerminalSelectionBounds { start, end } = terminal_selection_bounds(screen, selection);
     let mut output = String::new();
     for row_index in start.row..=end.row {
         let Some(row) = terminal_row(screen, row_index) else {
@@ -3981,7 +4057,7 @@ mod tests {
         TerminalSelection, anchored_terminal_scrollback, display_width, move_terminal_position,
         parse_command, parse_substitute_expression, render_terminal_row, render_text,
         render_text_with_selection, sgr_attributes, shift_terminal_selection,
-        terminal_live_position, terminal_selection_text,
+        terminal_live_position, terminal_selection_bounds, terminal_selection_text,
     };
     use bed_core::{Document, Editor, SelectionKind, SubstituteOptions, SubstituteRange};
     use bed_terminal::{Key, TerminalSize};
@@ -4039,6 +4115,7 @@ mod tests {
                         row: history,
                         column: 2,
                     },
+                    kind: SelectionKind::Character,
                 },
             ),
             "好b\nabcde"
@@ -4056,6 +4133,7 @@ mod tests {
                         row: history + 2,
                         column: 0,
                     },
+                    kind: SelectionKind::Character,
                 },
             ),
             "deX"
@@ -4091,9 +4169,47 @@ mod tests {
                 TerminalSelection {
                     anchor: TerminalPosition { row: 0, column: 0 },
                     cursor: TerminalPosition { row: 1, column: 0 },
+                    kind: SelectionKind::Character,
                 },
             ),
             "abc  X"
+        );
+    }
+
+    #[test]
+    fn terminal_line_selection_expands_across_soft_wrapped_logical_lines() {
+        let mut terminal = TerminalEmulator::new(4, 5, 0);
+        terminal.process(b"abcdeX\r\nlast");
+        assert!(terminal.screen().rows()[0].wrapped());
+
+        let wrapped_line = TerminalSelection {
+            anchor: TerminalPosition { row: 1, column: 0 },
+            cursor: TerminalPosition { row: 1, column: 0 },
+            kind: SelectionKind::Line,
+        };
+        assert_eq!(
+            terminal_selection_bounds(terminal.screen(), wrapped_line),
+            super::TerminalSelectionBounds {
+                start: TerminalPosition { row: 0, column: 0 },
+                end: TerminalPosition {
+                    row: 1,
+                    column: usize::MAX,
+                },
+            }
+        );
+        assert_eq!(
+            terminal_selection_text(terminal.screen(), wrapped_line),
+            "abcdeX"
+        );
+
+        let reverse_lines = TerminalSelection {
+            anchor: TerminalPosition { row: 2, column: 3 },
+            cursor: TerminalPosition { row: 1, column: 0 },
+            kind: SelectionKind::Line,
+        };
+        assert_eq!(
+            terminal_selection_text(terminal.screen(), reverse_lines),
+            "abcdeX\nlast"
         );
     }
 
@@ -4108,10 +4224,14 @@ mod tests {
             4,
             Some((
                 0,
-                TerminalSelection {
-                    anchor: TerminalPosition { row: 0, column: 0 },
-                    cursor: TerminalPosition { row: 0, column: 2 },
-                },
+                terminal_selection_bounds(
+                    terminal.screen(),
+                    TerminalSelection {
+                        anchor: TerminalPosition { row: 0, column: 0 },
+                        cursor: TerminalPosition { row: 0, column: 2 },
+                        kind: SelectionKind::Character,
+                    },
+                ),
             )),
         );
         let rendered = String::from_utf8(output).unwrap();
@@ -4126,12 +4246,14 @@ mod tests {
         let selection = TerminalSelection {
             anchor: TerminalPosition { row: 2, column: 1 },
             cursor: TerminalPosition { row: 5, column: 3 },
+            kind: SelectionKind::Line,
         };
         assert_eq!(
             shift_terminal_selection(selection, 3),
             Some(TerminalSelection {
                 anchor: TerminalPosition { row: 0, column: 1 },
                 cursor: TerminalPosition { row: 2, column: 3 },
+                kind: SelectionKind::Line,
             })
         );
         assert_eq!(shift_terminal_selection(selection, 6), None);
@@ -4217,7 +4339,11 @@ mod tests {
         });
         assert!(frame.windows(b"READY".len()).any(|bytes| bytes == b"READY"));
         assert!(frame.windows(5).any(|bytes| bytes == b"\x1b[31m"));
-        assert!(frame.windows(15).any(|bytes| bytes == b"TERMINAL printf"));
+        assert!(
+            frame
+                .windows(b"TERMINAL NORMAL printf".len())
+                .any(|bytes| bytes == b"TERMINAL NORMAL printf")
+        );
         assert!(frame.windows(7).any(|bytes| bytes == b"[exited"));
 
         app.close_active_window();
@@ -4273,8 +4399,8 @@ mod tests {
         });
         assert!(
             frame
-                .windows(b"TERMINAL child title".len())
-                .any(|bytes| bytes == b"TERMINAL child title")
+                .windows(b"TERMINAL NORMAL child title".len())
+                .any(|bytes| bytes == b"TERMINAL NORMAL child title")
         );
         assert!(
             app.message
@@ -4540,6 +4666,61 @@ mod tests {
         app.handle_key(Key::Char('w')).unwrap();
         app.handle_key(Key::Char('p')).unwrap();
         assert_eq!(app.editor().document().as_bytes(), b"COPY");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_visual_line_switches_kinds_and_yanks_a_line_register() {
+        use std::{
+            thread,
+            time::{Duration, Instant},
+        };
+
+        let mut app = app_with(b"");
+        execute(&mut app, "terminal printf 'one\\r\\ntwo'");
+        let session_id = app.active_terminal_session_id().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.terminals.get(session_id).is_some_and(|session| {
+            session.status().is_none()
+                || !session.reached_eof()
+                || !session.screen().contents().contains("two")
+        }) {
+            app.poll_terminals().unwrap();
+            assert!(
+                Instant::now() < deadline,
+                "terminal line selection output did not finish"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+
+        app.handle_key(Key::Char('V')).unwrap();
+        assert_eq!(app.mode(), Mode::TerminalVisual);
+        let view_id = app.active_terminal_view_id().unwrap();
+        assert_eq!(
+            app.terminal_views[&view_id].selection.unwrap().kind,
+            SelectionKind::Line
+        );
+        let frame = String::from_utf8(app.render(TerminalSize {
+            rows: 20,
+            columns: 80,
+        }))
+        .unwrap();
+        assert!(frame.contains("TERMINAL VISUAL LINE"));
+
+        app.handle_key(Key::Char('V')).unwrap();
+        assert_eq!(app.mode(), Mode::TerminalNormal);
+        app.handle_key(Key::Char('V')).unwrap();
+        app.handle_key(Key::Char('v')).unwrap();
+        assert_eq!(
+            app.terminal_views[&view_id].selection.unwrap().kind,
+            SelectionKind::Character
+        );
+        app.handle_key(Key::Char('V')).unwrap();
+        app.handle_key(Key::Char('y')).unwrap();
+
+        assert_eq!(app.mode(), Mode::TerminalNormal);
+        assert_eq!(app.register, Some(super::Register::Line(b"two".to_vec())));
+        assert!(app.message.contains("Terminal lines yanked"));
     }
 
     #[cfg(unix)]

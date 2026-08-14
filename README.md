@@ -84,6 +84,7 @@ Terminal Normal mode:
 - Page keys, `Ctrl-U`, and `Ctrl-D`: move by full or half pages.
 - `G` or End: return the navigation cursor to the live child cursor.
 - `v`: begin a cell-based Terminal Visual selection.
+- `V`: select complete logical terminal lines, joining their soft-wrapped rows.
 - `i`, `a`, or Enter: return to Terminal Input and live output.
 - `Ctrl-W`: apply one bed window command; `:` enters command mode.
 
@@ -91,7 +92,8 @@ Terminal Visual mode:
 
 - `h` / `j` / `k` / `l` or arrows: extend the selection by terminal cells.
 - `0` / `$` or Home / End: move to the start/end of the current terminal row.
-- `y`: copy the selection into bed's register; `Escape`, `Ctrl-C`, or `v` cancels.
+- `v` / `V`: switch between cell and logical-line selection; repeating the active key cancels.
+- `y`: copy into bed's characterwise or linewise register; `Escape` or `Ctrl-C` cancels.
 
 Terminal modes are intentionally bed-specific and do not promise Vim terminal
 compatibility.
