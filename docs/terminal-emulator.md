@@ -62,6 +62,12 @@ Several views may refer to one running session, but only the focused view owns
 its PTY dimensions. A view scrolled into history remains anchored as output
 arrives, including after the bounded history reaches capacity.
 
+The host loop forwards ordinary Terminal Input keys without redrawing stale
+emulator state, then redraws after PTY output is applied. Output events are
+coalesced within a short processing budget, and complete host frames are
+wrapped in synchronized-update markers so supporting terminals present them
+atomically instead of exposing clear-and-repaint intermediates.
+
 Closing a terminal window detaches its view without implicitly terminating the
 session. `:terminals` lists retained sessions, `:terminalattach ID` creates a
 new view, and `:terminalclose[!] ID` removes an unviewed session, optionally

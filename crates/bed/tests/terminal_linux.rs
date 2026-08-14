@@ -181,6 +181,17 @@ impl PseudoTerminal {
         Ok(output)
     }
 
+    fn collect_for(&mut self, duration: Duration) -> io::Result<Vec<u8>> {
+        let deadline = Instant::now() + duration;
+        let mut output = Vec::new();
+        while Instant::now() < deadline {
+            self.read_available(&mut output)?;
+            thread::sleep(Duration::from_millis(2));
+        }
+        self.read_available(&mut output)?;
+        Ok(output)
+    }
+
     fn read_available(&mut self, output: &mut Vec<u8>) -> io::Result<()> {
         let mut buffer = [0; 4096];
         loop {
@@ -268,6 +279,40 @@ fn edits_resizes_and_restores_a_real_pseudo_terminal() -> io::Result<()> {
     assert!(status.success());
     assert_eq!(fs::read(&path.0)?, "hello好".as_bytes());
     assert_eq!(terminal.termios()?, original);
+    Ok(())
+}
+
+#[test]
+fn terminal_input_redraws_after_child_output_instead_of_before_it() -> io::Result<()> {
+    let path = TempPath::new();
+    let mut terminal = PseudoTerminal::new(24, 80)?;
+    let child = terminal.spawn(&path.0)?;
+
+    terminal.wait_for_raw_mode()?;
+    terminal.wait_for_frame()?;
+    terminal.write_input(
+        concat!(
+            ":terminal stty raw -echo; ",
+            "printf '\\111\\116\\120\\125\\124\\137\\122\\105\\101\\104\\131'; ",
+            "dd bs=1 count=1 of=/dev/null 2>/dev/null; sleep 0.2; ",
+            "printf '\\103\\110\\111\\114\\104\\137\\105\\103\\110\\117'; sleep 1\r"
+        )
+        .as_bytes(),
+    )?;
+    terminal.wait_for_output(b"INPUT_READY")?;
+
+    terminal.write_input(b"x")?;
+    let premature = terminal.collect_for(Duration::from_millis(75))?;
+    assert!(
+        premature.is_empty(),
+        "forwarded terminal input produced {} output bytes before child output",
+        premature.len()
+    );
+    terminal.wait_for_output(b"CHILD_ECHO")?;
+
+    terminal.write_input(b"\x1c\x0e:q!\r")?;
+    terminal.wait_for_output(b"\x1b[?25h\x1b[?1006l\x1b[?1003l\x1b[?2004l\x1b[?1049l\x1b[0 q")?;
+    assert!(child.wait()?.success());
     Ok(())
 }
 

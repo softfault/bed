@@ -45,7 +45,7 @@ const NCCS: usize = 20;
 // SGR mouse reporting, and cursor visibility while bed owns the terminal.
 const ENTER_TERMINAL_SCREEN: &[u8] = b"\x1b[?1049h\x1b[?2004h\x1b[?1003h\x1b[?1006h\x1b[?25l";
 const LEAVE_TERMINAL_SCREEN: &[u8] =
-    b"\x1b[?25h\x1b[?1006l\x1b[?1003l\x1b[?2004l\x1b[?1049l\x1b[0 q";
+    b"\x1b[?2026l\x1b[?25h\x1b[?1006l\x1b[?1003l\x1b[?2004l\x1b[?1049l\x1b[0 q";
 
 /// Darwin `struct termios` from XNU termios.h.
 #[repr(C)]

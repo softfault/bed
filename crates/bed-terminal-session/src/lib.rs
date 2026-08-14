@@ -16,11 +16,13 @@ use std::{
     process::{Command, ExitStatus},
     sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
     thread,
+    time::{Duration, Instant},
 };
 
 const DEFAULT_QUEUE_CAPACITY: usize = 256;
 const READ_BUFFER_SIZE: usize = 8192;
-const OUTPUT_EVENTS_PER_POLL: usize = 64;
+const OUTPUT_EVENTS_PER_POLL: usize = DEFAULT_QUEUE_CAPACITY;
+const OUTPUT_POLL_BUDGET: Duration = Duration::from_millis(8);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TerminalSessionId(u64);
@@ -165,7 +167,11 @@ impl TerminalSession {
         let mut result = PollResult::default();
         let bells_before = self.terminal.bell_count();
         let visual_bells_before = self.terminal.visual_bell_count();
+        let started = Instant::now();
         while result.output_events < OUTPUT_EVENTS_PER_POLL {
+            if result.output_events > 0 && started.elapsed() >= OUTPUT_POLL_BUDGET {
+                break;
+            }
             if !self.flush_pending_responses()? {
                 break;
             }

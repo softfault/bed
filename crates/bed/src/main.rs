@@ -20,20 +20,18 @@ fn main() -> Result<()> {
             terminal.draw(&frame)?;
             redraw = false;
         }
-        let batch = events.next_batch(Duration::from_millis(100))?;
-        if !batch.is_empty() {
-            redraw = true;
-        }
+        let batch = events.next_batch(Duration::from_millis(16))?;
         for event in batch {
             if app.should_quit() {
                 break;
             }
             match event {
-                TerminalEvent::Key(key) => app.handle_key(key)?,
-                TerminalEvent::Mouse(mouse) => app.handle_mouse(mouse),
+                TerminalEvent::Key(key) => redraw |= app.handle_key(key)?,
+                TerminalEvent::Mouse(mouse) => redraw |= app.handle_mouse(mouse),
                 TerminalEvent::Resize(resized) => {
                     size = resized;
                     app.handle_resize(resized);
+                    redraw = true;
                 }
             }
         }

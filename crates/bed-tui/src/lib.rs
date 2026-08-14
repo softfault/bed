@@ -309,29 +309,57 @@ impl App {
         app
     }
 
-    pub fn handle_key(&mut self, key: Key) -> Result<()> {
+    pub fn handle_key(&mut self, key: Key) -> Result<bool> {
+        let had_message = !self.message.is_empty();
         self.message.clear();
-        match self.mode {
-            Mode::Normal => self.handle_normal_key(key)?,
-            Mode::Insert => self.handle_insert_key(key)?,
-            Mode::Visual => self.handle_visual_key(key, SelectionKind::Character)?,
-            Mode::VisualLine => self.handle_visual_key(key, SelectionKind::Line)?,
-            Mode::Command => self.handle_command_key(key)?,
-            Mode::Search => self.handle_search_key(key),
-            Mode::Tree => self.handle_tree_key(key),
+        let redraw = match self.mode {
+            Mode::Normal => {
+                self.handle_normal_key(key)?;
+                true
+            }
+            Mode::Insert => {
+                self.handle_insert_key(key)?;
+                true
+            }
+            Mode::Visual => {
+                self.handle_visual_key(key, SelectionKind::Character)?;
+                true
+            }
+            Mode::VisualLine => {
+                self.handle_visual_key(key, SelectionKind::Line)?;
+                true
+            }
+            Mode::Command => {
+                self.handle_command_key(key)?;
+                true
+            }
+            Mode::Search => {
+                self.handle_search_key(key);
+                true
+            }
+            Mode::Tree => {
+                self.handle_tree_key(key);
+                true
+            }
             Mode::TerminalInput => self.handle_terminal_input_key(key),
-            Mode::TerminalNormal => self.handle_terminal_normal_key(key),
-            Mode::TerminalVisual => self.handle_terminal_visual_key(key),
-        }
-        Ok(())
+            Mode::TerminalNormal => {
+                self.handle_terminal_normal_key(key);
+                true
+            }
+            Mode::TerminalVisual => {
+                self.handle_terminal_visual_key(key);
+                true
+            }
+        };
+        Ok(redraw || had_message || !self.message.is_empty())
     }
 
-    pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
         if self.mode != Mode::TerminalInput {
-            return;
+            return false;
         }
         let Some(view_id) = self.active_terminal_view_id() else {
-            return;
+            return false;
         };
         let Some((_, area)) = self
             .layout
@@ -339,7 +367,7 @@ impl App {
             .into_iter()
             .find(|(window_id, _)| *window_id == self.active_window)
         else {
-            return;
+            return false;
         };
         let text_rows = area.rows.saturating_sub(1);
         if mouse.row < area.row
@@ -347,16 +375,16 @@ impl App {
             || mouse.column < area.column
             || mouse.column >= area.column.saturating_add(area.columns)
         {
-            return;
+            return false;
         }
         let Some(view) = self.terminal_views.get(&view_id) else {
-            return;
+            return false;
         };
         if view.scrollback > 0 {
-            return;
+            return false;
         }
         let Some(session) = self.terminals.get(view.session_id) else {
-            return;
+            return false;
         };
         let child_event = MouseEvent {
             row: mouse.row - area.row,
@@ -365,7 +393,9 @@ impl App {
         };
         if let Err(error) = session.send_mouse(child_event) {
             self.message = format!("Terminal mouse failed: {error:#}");
+            return true;
         }
+        false
     }
 
     pub fn handle_resize(&mut self, size: TerminalSize) {
@@ -796,7 +826,10 @@ impl App {
                 view.selection = None;
                 continue;
             }
-            view.scrollback = anchored_terminal_scrollback(view.scrollback, before, after, maximum);
+            if view.scrollback > 0 {
+                view.scrollback =
+                    anchored_terminal_scrollback(view.scrollback, before, after, maximum);
+            }
             let discarded = usize::try_from(discarded_after.saturating_sub(discarded_before))
                 .unwrap_or(usize::MAX);
             view.cursor.row = view.cursor.row.saturating_sub(discarded);
@@ -843,7 +876,7 @@ impl App {
             && self
                 .active_terminal_session_id()
                 .and_then(|id| self.terminals.get(id))
-                .is_some_and(|session| session.status().is_some())
+                .is_some_and(|session| session.status().is_some() && session.reached_eof())
         {
             self.enter_terminal_normal();
         }
@@ -863,7 +896,7 @@ impl App {
             .map(|view| view.session_id)
     }
 
-    fn send_active_terminal_key(&mut self, key: &Key) {
+    fn send_active_terminal_key(&mut self, key: &Key) -> bool {
         let result = self
             .active_terminal_session_id()
             .context("active window is not a terminal")
@@ -876,7 +909,9 @@ impl App {
         if let Err(error) = result {
             self.message
                 .push_str(&format!("Terminal input failed: {error:#}"));
+            return true;
         }
+        false
     }
 
     fn set_active_terminal_scrollback(&mut self, rows: usize) {
@@ -986,24 +1021,35 @@ impl App {
             .map_or(1, |(_, area)| area.rows.saturating_sub(1).max(1))
     }
 
-    fn handle_terminal_input_key(&mut self, key: Key) {
+    fn handle_terminal_input_key(&mut self, key: Key) -> bool {
         if self.pending.take() == Some(Pending::Window) {
             self.sync_active_terminal_cursor_to_child();
             self.execute_window_key(&key, None, false);
-            return;
+            return true;
         }
         if self.terminal_prefix {
             self.terminal_prefix = false;
-            match key {
-                Key::Ctrl('n') => self.enter_terminal_normal(),
-                Key::Ctrl('w') => self.pending = Some(Pending::Window),
+            return match key {
+                Key::Ctrl('n') => {
+                    self.enter_terminal_normal();
+                    true
+                }
+                Key::Ctrl('w') => {
+                    self.pending = Some(Pending::Window);
+                    false
+                }
                 Key::Ctrl('\\') => self.send_active_terminal_key(&Key::Ctrl('\\')),
-                _ => self.message.push_str("Invalid terminal prefix"),
-            }
-            return;
+                _ => {
+                    self.message.push_str("Invalid terminal prefix");
+                    true
+                }
+            };
         }
         match key {
-            Key::Ctrl('\\') => self.terminal_prefix = true,
+            Key::Ctrl('\\') => {
+                self.terminal_prefix = true;
+                false
+            }
             key => self.send_active_terminal_key(&key),
         }
     }
@@ -3867,6 +3913,9 @@ fn anchored_terminal_scrollback(
     history_after: u64,
     maximum: usize,
 ) -> usize {
+    if current == 0 {
+        return 0;
+    }
     let advanced =
         usize::try_from(history_after.saturating_sub(history_before)).unwrap_or(usize::MAX);
     current.saturating_add(advanced).min(maximum)
@@ -3932,7 +3981,7 @@ mod tests {
         TerminalSelection, anchored_terminal_scrollback, display_width, move_terminal_position,
         parse_command, parse_substitute_expression, render_terminal_row, render_text,
         render_text_with_selection, sgr_attributes, shift_terminal_selection,
-        terminal_selection_text,
+        terminal_live_position, terminal_selection_text,
     };
     use bed_core::{Document, Editor, SelectionKind, SubstituteOptions, SubstituteRange};
     use bed_terminal::{Key, TerminalSize};
@@ -4403,19 +4452,19 @@ mod tests {
         });
         app.handle_key(Key::Ctrl('\\')).unwrap();
         app.handle_key(Key::Ctrl('n')).unwrap();
-        app.handle_mouse(MouseEvent {
+        assert!(!app.handle_mouse(MouseEvent {
             row: area.row + 1,
             column: area.column + 2,
             action: MouseAction::Press(MouseButton::Left),
             modifiers: Modifiers::default(),
-        });
+        }));
         app.handle_key(Key::Char('i')).unwrap();
-        app.handle_mouse(MouseEvent {
+        assert!(!app.handle_mouse(MouseEvent {
             row: area.row + 1,
             column: area.column + 2,
             action: MouseAction::Press(MouseButton::Left),
             modifiers: Modifiers::default(),
-        });
+        }));
 
         let deadline = Instant::now() + Duration::from_secs(5);
         while app.terminals.get(session_id).is_some_and(|session| {
@@ -4535,7 +4584,7 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(2));
         }
-        for key in [
+        for (index, key) in [
             Key::Char('h'),
             Key::Char('e'),
             Key::Char('l'),
@@ -4546,8 +4595,11 @@ mod tests {
             Key::Ctrl('\\'),
             Key::Ctrl('\\'),
             Key::Ctrl('n'),
-        ] {
-            app.handle_key(key).unwrap();
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(app.handle_key(key).unwrap(), index == 9);
         }
 
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -4587,8 +4639,45 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn live_terminal_view_stays_at_the_bottom_during_output_floods() {
+        use std::{
+            thread,
+            time::{Duration, Instant},
+        };
+
+        let mut app = app_with(b"");
+        execute(&mut app, "terminal seq 1 12000");
+        let view_id = app.active_terminal_view_id().unwrap();
+        let session_id = app.active_terminal_session_id().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.terminals.get(session_id).is_some_and(|session| {
+            session.status().is_none()
+                || !session.reached_eof()
+                || !session.screen().contents().contains("12000")
+        }) {
+            app.poll_terminals().unwrap();
+            assert!(
+                Instant::now() < deadline,
+                "terminal output flood did not finish"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+
+        assert_eq!(app.terminal_views[&view_id].scrollback, 0);
+        assert_eq!(app.mode(), Mode::TerminalNormal);
+        let session = app.terminals.get(session_id).unwrap();
+        assert_eq!(
+            app.terminal_views[&view_id].cursor,
+            terminal_live_position(session.screen())
+        );
+        assert_eq!(app.terminal_views[&view_id].scrollback, 0);
+    }
+
     #[test]
     fn anchors_bounded_terminal_scrollback_as_history_advances() {
+        assert_eq!(anchored_terminal_scrollback(0, 10, 12, 10), 0);
         assert_eq!(anchored_terminal_scrollback(3, 10, 12, 10), 5);
         assert_eq!(anchored_terminal_scrollback(9, 10, 12, 10), 10);
         assert_eq!(anchored_terminal_scrollback(9, 12, 3, 4), 4);

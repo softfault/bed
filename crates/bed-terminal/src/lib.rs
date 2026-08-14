@@ -15,6 +15,8 @@ use std::{
 };
 
 const EVENT_QUEUE_CAPACITY: usize = 256;
+const BEGIN_SYNCHRONIZED_UPDATE: &[u8] = b"\x1b[?2026h";
+const END_SYNCHRONIZED_UPDATE: &[u8] = b"\x1b[?2026l";
 
 mod child;
 
@@ -225,7 +227,13 @@ impl Terminal {
     }
 
     pub fn draw(&mut self, bytes: &[u8]) -> Result<()> {
-        self.platform.draw(bytes)
+        let mut output = Vec::with_capacity(
+            BEGIN_SYNCHRONIZED_UPDATE.len() + bytes.len() + END_SYNCHRONIZED_UPDATE.len(),
+        );
+        output.extend_from_slice(BEGIN_SYNCHRONIZED_UPDATE);
+        output.extend_from_slice(bytes);
+        output.extend_from_slice(END_SYNCHRONIZED_UPDATE);
+        self.platform.draw(&output)
     }
 }
 
