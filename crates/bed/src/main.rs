@@ -12,11 +12,19 @@ fn main() -> Result<()> {
     let mut terminal = Terminal::new()?;
     let mut size = terminal.size()?;
     let events = terminal.events()?;
+    let mut redraw = true;
 
     while !app.should_quit() {
-        let frame = app.render(size);
-        terminal.draw(&frame)?;
-        for event in events.next_batch(Duration::from_millis(100))? {
+        if redraw {
+            let frame = app.render(size);
+            terminal.draw(&frame)?;
+            redraw = false;
+        }
+        let batch = events.next_batch(Duration::from_millis(100))?;
+        if !batch.is_empty() {
+            redraw = true;
+        }
+        for event in batch {
             if app.should_quit() {
                 break;
             }
@@ -29,7 +37,7 @@ fn main() -> Result<()> {
                 }
             }
         }
-        app.poll_terminals()?;
+        redraw |= app.poll_terminals()?;
     }
     Ok(())
 }

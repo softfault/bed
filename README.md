@@ -79,8 +79,10 @@ Terminal Input mode:
 
 Terminal Normal mode:
 
-- `j` / `k`, arrows, page keys, `Ctrl-U`, and `Ctrl-D`: navigate view-local scrollback.
-- `G` or End: return to live output.
+- `h` / `j` / `k` / `l` or arrows: move a view-local navigation cursor through terminal cells; the viewport scrolls when needed.
+- `0` / `$` or Home: move to the start/end of the current terminal row.
+- Page keys, `Ctrl-U`, and `Ctrl-D`: move by full or half pages.
+- `G` or End: return the navigation cursor to the live child cursor.
 - `v`: begin a cell-based Terminal Visual selection.
 - `i`, `a`, or Enter: return to Terminal Input and live output.
 - `Ctrl-W`: apply one bed window command; `:` enters command mode.

@@ -38,11 +38,12 @@ Terminal Input reserves a bed-owned `Ctrl-\` prefix:
 - `Ctrl-\ Ctrl-\` sends a literal `Ctrl-\` to the child.
 
 Other prefixed keys are rejected instead of being forwarded ambiguously.
-Terminal Normal uses `j`, `k`, arrows, page keys, `Ctrl-U`, and `Ctrl-D` for
-view-local scrollback, while `G` or End returns to live output. `i`, `a`, and
-Enter return to Terminal Input and live output. `:` opens bed's command mode
-and `Ctrl-W` applies a window command. These are bed semantics rather than a
-Vim compatibility contract.
+Terminal Normal owns a view-local navigation cursor. `h`, `j`, `k`, `l`,
+arrows, row edges, page keys, `Ctrl-U`, and `Ctrl-D` move it through terminal
+cells and scroll the viewport only as needed; `G` or End returns it to the live
+child cursor. `i`, `a`, and Enter return to Terminal Input and live output. `:`
+opens bed's command mode and `Ctrl-W` applies a window command. These are bed
+semantics rather than a Vim compatibility contract.
 
 Host mouse input is normalized to zero-based cell coordinates on every native
 backend. In Terminal Input, events inside the focused terminal's live content
