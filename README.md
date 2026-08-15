@@ -43,9 +43,9 @@ Normal mode:
 - `u`, `Ctrl-R`: undo and redo
 - `Ctrl-W` followed by `h`, `j`, `k`, `l`, or `w`: move between split windows
 - `[count] Ctrl-W <` / `>`: decrease/increase the active window width
-- `[count] Ctrl-W -` / `+`: decrease/increase the active window height
+- `[count] Ctrl-W -` / `+`: decrease/increase the active window height; `Ctrl-_` is also accepted for decrease because terminals commonly encode `Ctrl--` that way
 - `[count] Ctrl-W |` / `_`: set the active window width/height exactly; without a count, maximize it
-- `Ctrl-W =`: equalize every split in the current tab page
+- `Ctrl-W =`: equalize every split in the current tab page, including restoring a maximized window
 - `gt` / `gT`: move to the next/previous tab page
 - `[count]gt`: switch directly to the 1-based tab position
 - `Tab` / `[count]Tab`: move to the next tab page or directly to a 1-based tab position

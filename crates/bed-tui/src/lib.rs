@@ -2491,7 +2491,7 @@ impl App {
                 Key::Char('|') => {
                     self.resize_file_tree(ResizeAmount::Exact(count.unwrap_or(usize::MAX)))
                 }
-                Key::Char('-') | Key::Char('+') | Key::Char('_') => {
+                Key::Char('-') | Key::Char('+') | Key::Char('_') | Key::Ctrl('_') => {
                     self.message.push_str("File tree height is fixed");
                 }
                 Key::Char('=') => self.file_tree_width = DEFAULT_FILE_TREE_WIDTH,
@@ -2513,7 +2513,7 @@ impl App {
             Key::Char('>') => {
                 self.resize_active_window(SplitAxis::Columns, ResizeAmount::Increase(amount))
             }
-            Key::Char('-') => {
+            Key::Char('-') | Key::Ctrl('_') => {
                 self.resize_active_window(SplitAxis::Rows, ResizeAmount::Decrease(amount));
             }
             Key::Char('+') => {
@@ -4910,6 +4910,10 @@ mod tests {
         assert_eq!(app.mode(), Mode::TerminalNormal);
 
         app.handle_key(Key::Char('k')).unwrap();
+        app.handle_key(Key::Ctrl('j')).unwrap();
+        assert_eq!(app.mode(), Mode::TerminalNormal);
+        assert!(app.message.contains("Invalid Terminal Normal command"));
+        app.message.clear();
         app.handle_key(Key::Char('i')).unwrap();
         assert_eq!(app.mode(), Mode::TerminalInput);
         assert_eq!(
@@ -5399,6 +5403,18 @@ mod tests {
         assert_eq!(app.layout.rectangles(app.editor_area())[2].1.rows, 3);
         execute(&mut app, "resize +2");
         assert_eq!(app.layout.rectangles(app.editor_area())[2].1.rows, 5);
+
+        app.handle_key(Key::Ctrl('w')).unwrap();
+        app.handle_key(Key::Char('_')).unwrap();
+        let maximized_rows = app.layout.rectangles(app.editor_area())[2].1.rows;
+        assert!(maximized_rows > 5);
+
+        app.handle_key(Key::Ctrl('w')).unwrap();
+        app.handle_key(Key::Ctrl('_')).unwrap();
+        assert_eq!(
+            app.layout.rectangles(app.editor_area())[2].1.rows,
+            maximized_rows - 1
+        );
     }
 
     #[test]

@@ -52,7 +52,8 @@ impl<R: Read> VtInput<R> {
         };
 
         let event = match byte {
-            b'\r' | b'\n' => Key::Enter,
+            b'\r' => Key::Enter,
+            b'\n' => Key::Ctrl('j'),
             b'\t' => Key::Tab,
             8 | 127 => Key::Backspace,
             1..=26 => Key::Ctrl(char::from(byte + b'a' - 1)),
@@ -353,13 +354,14 @@ mod tests {
 
     #[test]
     fn decodes_ascii_and_utf8_input() {
-        let mut input = VtInput::new(Cursor::new("a好\t\x1b[Z\n".as_bytes()));
+        let mut input = VtInput::new(Cursor::new("a好\t\x1b[Z\r\n".as_bytes()));
 
         assert_eq!(input.read_key().unwrap(), Some(Key::Char('a')));
         assert_eq!(input.read_key().unwrap(), Some(Key::Char('好')));
         assert_eq!(input.read_key().unwrap(), Some(Key::Tab));
         assert_eq!(input.read_key().unwrap(), Some(Key::BackTab));
         assert_eq!(input.read_key().unwrap(), Some(Key::Enter));
+        assert_eq!(input.read_key().unwrap(), Some(Key::Ctrl('j')));
         assert_eq!(input.read_key().unwrap(), None);
     }
 
