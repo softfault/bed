@@ -19,7 +19,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "bad-editor"
-version = "0.3.0"
+version = "0.4.0-beta.1"
 dependencies = [
  "anyhow",
  "bed-core",
@@ -29,7 +29,7 @@ dependencies = [
 
 [[package]]
 name = "bed-core"
-version = "0.3.0"
+version = "0.4.0-beta.1"
 dependencies = [
  "anyhow",
  "bed-file",
@@ -39,14 +39,14 @@ dependencies = [
 
 [[package]]
 name = "bed-file"
-version = "0.3.0"
+version = "0.4.0-beta.1"
 dependencies = [
  "anyhow",
 ]
 
 [[package]]
 name = "bed-pty"
-version = "0.3.0"
+version = "0.4.0-beta.1"
 dependencies = [
  "anyhow",
  "bed-terminal",
@@ -55,7 +55,7 @@ dependencies = [
 
 [[package]]
 name = "bed-terminal"
-version = "0.3.0"
+version = "0.4.0-beta.1"
 dependencies = [
  "anyhow",
  "bed-vt100",
@@ -63,7 +63,7 @@ dependencies = [
 
 [[package]]
 name = "bed-terminal-session"
-version = "0.3.0"
+version = "0.4.0-beta.1"
 dependencies = [
  "anyhow",
  "bed-pty",
@@ -74,7 +74,7 @@ dependencies = [
 
 [[package]]
 name = "bed-tui"
-version = "0.3.0"
+version = "0.4.0-beta.1"
 dependencies = [
  "anyhow",
  "bed-core",
@@ -87,7 +87,7 @@ dependencies = [
 
 [[package]]
 name = "bed-vt100"
-version = "0.3.0"
+version = "0.4.0-beta.1"
 dependencies = [
  "unicode-width",
 ]

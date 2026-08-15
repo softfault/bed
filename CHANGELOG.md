@@ -4,6 +4,10 @@ All notable changes to bed are documented in this file.
 
 ## [Unreleased]
 
+Changes after the beta release will be collected here.
+
+## [0.4.0-beta.1] - 2026-08-15
+
 ### Added
 
 - Independently maintained `bed-vt100`, native PTY/ConPTY process backends,
@@ -79,7 +83,8 @@ All notable changes to bed are documented in this file.
 - Native terminal backends for Linux, Windows, macOS, FreeBSD, and NetBSD.
 - Native runtime coverage on Linux x86_64 and Windows x86_64, with cross-target checks for the other supported targets.
 
-[Unreleased]: https://github.com/softfault/bed/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/softfault/bed/compare/v0.4.0-beta.1...HEAD
+[0.4.0-beta.1]: https://github.com/softfault/bed/compare/v0.3.0...v0.4.0-beta.1
 [0.3.0]: https://github.com/softfault/bed/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/softfault/bed/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/softfault/bed/compare/v0.1.0...v0.2.0
