@@ -34,6 +34,7 @@ Normal mode:
 - `[count] h/j/k/l` or arrows: move, optionally by a counted number of positions
 - `[count] w/b/e`: move by Unicode-aware words
 - `0` / `$`, `gg` / `G`: line start/end, file start/end
+- `[count]gg` / `[count]G`: jump to a 1-based document line (for example, `145gg` or `145G`)
 - `Ctrl-U` / `Ctrl-D` or `Page Up` / `Page Down`: scroll by half/full pages
 - `i a I A`, `o O`: enter insert mode
 - `x`, `dd`, `dw`, `d$`: delete character, line, word, or to line end
@@ -51,6 +52,10 @@ Normal mode:
 - `Tab` / `[count]Tab`: move to the next tab page or directly to a 1-based tab position
 - `Shift-Tab` / `[count]Shift-Tab`: move to the previous tab page
 - `:`: enter command mode
+
+Editor windows soft-wrap long logical lines at grapheme boundaries. The line
+number gutter shows the current line's absolute number and relative distances
+for every other logical line; wrapped continuation rows keep the gutter blank.
 
 Insert mode:
 

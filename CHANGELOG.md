@@ -19,6 +19,9 @@ All notable changes to bed are documented in this file.
   differences from `vt100 0.15.2` documented explicitly.
 - Native host mouse input and mode-aware forwarding to focused embedded
   terminals, including SGR coordinates, modifiers, dragging, and wheel events.
+- Counted line jumps through `[count]gg` and `[count]G`.
+- Soft-wrapped editor lines with grapheme-safe visual rows, viewport scrolling,
+  and absolute-current plus relative line numbers enabled by default.
 
 ### Fixed
 

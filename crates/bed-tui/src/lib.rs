@@ -134,7 +134,7 @@ enum Register {
 #[derive(Clone, Debug)]
 struct Viewport {
     row_offset: usize,
-    column_offset: usize,
+    wrap_offset: usize,
     rows: usize,
 }
 
@@ -211,7 +211,7 @@ impl Default for Viewport {
     fn default() -> Self {
         Self {
             row_offset: 0,
-            column_offset: 0,
+            wrap_offset: 0,
             rows: 1,
         }
     }
@@ -536,6 +536,10 @@ impl App {
         self.scroll_window(window_id, viewport_rows, text_columns);
 
         let viewport = self.window_viewport(window_id).clone();
+        let (current_row, _) = self.editor.position();
+        let current_column = self.cursor_display_column();
+        let trailing_cursor_row =
+            (window_id == self.active_window && self.mode == Mode::Insert).then_some(current_row);
         let selection_kind = match self.mode {
             Mode::Visual => Some(SelectionKind::Character),
             Mode::VisualLine => Some(SelectionKind::Line),
@@ -547,34 +551,87 @@ impl App {
                     .and_then(|kind| self.editor.selection_range(kind).map(|range| (range, kind)))
             })
             .flatten();
-        for screen_row in 0..text_rows {
-            move_to(output, area.row + screen_row + 1, area.column + 1);
-            let document_row = viewport.row_offset + screen_row;
+        let wrap_width = text_columns.max(1);
+        let mut screen_row = 0;
+        let mut document_row = viewport.row_offset;
+        let mut segment_index = viewport.wrap_offset;
+        while screen_row < text_rows {
             let line = self.editor.document().line(document_row);
-            if line_number_width > 0 {
-                output.extend_from_slice(
-                    render_line_number(document_row, line.is_some(), line_number_width).as_bytes(),
-                );
-            }
             if let Some(line) = line {
+                let starts = wrapped_line_starts_for_cursor(
+                    line,
+                    wrap_width,
+                    trailing_cursor_row == Some(document_row)
+                        && current_column == line_display_width(line),
+                );
+                let start_index = segment_index.min(starts.len().saturating_sub(1));
                 let line_start = self
                     .editor
                     .line_byte_range(document_row)
                     .expect("rendered line is missing its byte range")
                     .start;
-                output.extend_from_slice(
-                    render_text_with_selection(
+                let total_width = line_display_width(line);
+                for index in start_index..starts.len() {
+                    if screen_row >= text_rows {
+                        break;
+                    }
+                    let column_offset = starts[index];
+                    let segment_end = starts.get(index + 1).copied().unwrap_or(total_width);
+                    move_to(output, area.row + screen_row + 1, area.column + 1);
+                    if line_number_width > 0 {
+                        output.extend_from_slice(
+                            render_line_number(
+                                document_row,
+                                true,
+                                line_number_width,
+                                current_row,
+                                index > 0,
+                            )
+                            .as_bytes(),
+                        );
+                    }
+                    let rendered = render_text_with_selection(
                         line,
                         line_start,
                         selection.as_ref().map(|(range, kind)| (range, *kind)),
-                        viewport.column_offset,
+                        column_offset,
                         text_columns,
-                    )
-                    .as_bytes(),
-                );
-            } else if line_number_width == 0 {
-                output.push(b'~');
+                    );
+                    output.extend_from_slice(rendered.as_bytes());
+                    output.extend(std::iter::repeat_n(
+                        b' ',
+                        text_columns.saturating_sub(segment_end.saturating_sub(column_offset)),
+                    ));
+                    screen_row += 1;
+                }
+            } else {
+                move_to(output, area.row + screen_row + 1, area.column + 1);
+                if line_number_width > 0 {
+                    output.extend_from_slice(
+                        render_line_number(
+                            document_row,
+                            false,
+                            line_number_width,
+                            current_row,
+                            false,
+                        )
+                        .as_bytes(),
+                    );
+                } else {
+                    output.push(b'~');
+                }
+                output.extend(std::iter::repeat_n(
+                    b' ',
+                    if line_number_width > 0 {
+                        text_columns
+                    } else {
+                        text_columns.saturating_sub(1)
+                    },
+                ));
+                screen_row += 1;
             }
+            document_row += 1;
+            segment_index = 0;
         }
 
         move_to(output, area.row + area.rows, area.column + 1);
@@ -786,6 +843,7 @@ impl App {
         }
         let line_number_width =
             line_number_width(self.editor.document().line_count(), area.columns);
+        let text_columns = area.columns.saturating_sub(line_number_width);
         let viewport = self
             .windows
             .get(&self.active_window)
@@ -793,9 +851,27 @@ impl App {
             .expect("active editor view is missing its viewport");
         let (row, _) = self.editor.position();
         let column = self.cursor_display_column();
+        let line = self.editor.document().line(row).unwrap_or_default();
+        let starts = wrapped_line_starts_for_cursor(
+            line,
+            text_columns.max(1),
+            self.mode == Mode::Insert && column == line_display_width(line),
+        );
+        let segment = starts
+            .partition_point(|&start| start <= column)
+            .saturating_sub(1);
+        let visual_row = visual_row_distance(
+            self.editor.document(),
+            viewport.row_offset,
+            viewport.wrap_offset,
+            row,
+            segment,
+            text_columns.max(1),
+        );
+        let segment_start = starts.get(segment).copied().unwrap_or(0);
         (
-            area.row + row.saturating_sub(viewport.row_offset) + 1,
-            area.column + line_number_width + column.saturating_sub(viewport.column_offset) + 1,
+            area.row + visual_row + 1,
+            area.column + line_number_width + column.saturating_sub(segment_start) + 1,
         )
     }
 
@@ -1333,8 +1409,8 @@ impl App {
                     return Ok(());
                 }
                 (Pending::Go, Key::Char('g')) => {
-                    self.count = None;
-                    self.editor.move_to_first_line();
+                    let line = self.count.take().unwrap_or(1);
+                    self.editor.move_to_line(line);
                     return Ok(());
                 }
                 (Pending::Go, Key::Char('t')) => {
@@ -1377,6 +1453,7 @@ impl App {
             return Ok(());
         }
 
+        let explicit_count = self.count.is_some();
         let count = if matches!(
             key,
             Key::Char('g') | Key::Char('d') | Key::Char('y') | Key::Ctrl('w')
@@ -1429,7 +1506,13 @@ impl App {
                 }
             }
             Key::Char('g') => self.pending = Some(Pending::Go),
-            Key::Char('G') => self.editor.move_to_last_line(),
+            Key::Char('G') => {
+                if explicit_count {
+                    self.editor.move_to_line(count);
+                } else {
+                    self.editor.move_to_last_line();
+                }
+            }
             Key::Char('v') => self.enter_visual(SelectionKind::Character),
             Key::Char('V') => self.enter_visual(SelectionKind::Line),
             Key::Char('d') => self.pending = Some(Pending::Delete),
@@ -1528,11 +1611,12 @@ impl App {
             return Ok(());
         }
         if self.pending.take() == Some(Pending::Go) && key == Key::Char('g') {
-            self.count = None;
-            self.editor.move_to_first_line();
+            let line = self.count.take().unwrap_or(1);
+            self.editor.move_to_line(line);
             return Ok(());
         }
 
+        let explicit_count = self.count.is_some();
         let count = if key == Key::Char('g') {
             1
         } else {
@@ -1600,7 +1684,13 @@ impl App {
                 }
             }
             Key::Char('g') => self.pending = Some(Pending::Go),
-            Key::Char('G') => self.editor.move_to_last_line(),
+            Key::Char('G') => {
+                if explicit_count {
+                    self.editor.move_to_line(count);
+                } else {
+                    self.editor.move_to_last_line();
+                }
+            }
             Key::Char('y') => self.yank_visual(kind),
             Key::Char('d') | Key::Char('x') | Key::Delete => self.delete_visual(kind),
             Key::Char('p') | Key::Char('P') => self.put_over_visual(kind)?,
@@ -3311,17 +3401,60 @@ impl App {
 
     fn scroll_window(&mut self, window_id: WindowId, text_rows: usize, columns: usize) {
         let (row, _) = self.editor.position();
-        if row < self.window_viewport(window_id).row_offset {
-            self.window_viewport_mut(window_id).row_offset = row;
-        } else if row >= self.window_viewport(window_id).row_offset + text_rows {
-            self.window_viewport_mut(window_id).row_offset = row - text_rows + 1;
-        }
+        let line = self.editor.document().line(row).unwrap_or_default();
+        let wrap_width = columns.max(1);
+        let cursor_column = self.cursor_display_column();
+        let starts = wrapped_line_starts_for_cursor(
+            line,
+            wrap_width,
+            window_id == self.active_window
+                && self.mode == Mode::Insert
+                && cursor_column == line_display_width(line),
+        );
+        let cursor_segment = starts
+            .partition_point(|&start| start <= cursor_column)
+            .saturating_sub(1);
+        let viewport = self.window_viewport(window_id).clone();
 
-        let column = self.cursor_display_column();
-        if column < self.window_viewport(window_id).column_offset {
-            self.window_viewport_mut(window_id).column_offset = column;
-        } else if column >= self.window_viewport(window_id).column_offset + columns {
-            self.window_viewport_mut(window_id).column_offset = column - columns + 1;
+        if row < viewport.row_offset
+            || (row == viewport.row_offset && cursor_segment < viewport.wrap_offset)
+        {
+            let viewport = self.window_viewport_mut(window_id);
+            viewport.row_offset = row;
+            viewport.wrap_offset = cursor_segment;
+        } else {
+            let distance = visual_row_distance(
+                self.editor.document(),
+                viewport.row_offset,
+                viewport.wrap_offset,
+                row,
+                cursor_segment,
+                wrap_width,
+            );
+            if distance >= text_rows {
+                let mut top_row = row;
+                let mut top_segment = cursor_segment;
+                let mut remaining = text_rows.saturating_sub(1);
+                while remaining > 0 {
+                    if top_segment > 0 {
+                        top_segment -= 1;
+                    } else if top_row > 0 {
+                        top_row -= 1;
+                        top_segment = wrapped_line_starts(
+                            self.editor.document().line(top_row).unwrap_or_default(),
+                            wrap_width,
+                        )
+                        .len()
+                        .saturating_sub(1);
+                    } else {
+                        break;
+                    }
+                    remaining -= 1;
+                }
+                let viewport = self.window_viewport_mut(window_id);
+                viewport.row_offset = top_row;
+                viewport.wrap_offset = top_segment;
+            }
         }
     }
 
@@ -3626,6 +3759,68 @@ fn render_text(bytes: &[u8], column_offset: usize, width: usize) -> String {
     render_text_with_selection(bytes, 0, None, column_offset, width)
 }
 
+fn line_display_width(bytes: &[u8]) -> usize {
+    display_width(&String::from_utf8_lossy(bytes))
+}
+
+fn wrapped_line_starts(bytes: &[u8], width: usize) -> Vec<usize> {
+    let width = width.max(1);
+    let (text, _) = lossy_text_with_source_boundaries(bytes);
+    let mut starts = vec![0];
+    let mut column = 0;
+    let mut segment_start = 0;
+    for grapheme in text.graphemes(true) {
+        let grapheme_width = grapheme_display_width(grapheme, column);
+        if column > segment_start && column - segment_start + grapheme_width > width {
+            starts.push(column);
+            segment_start = column;
+        }
+        column += grapheme_width;
+    }
+    starts
+}
+
+fn wrapped_line_starts_for_cursor(
+    bytes: &[u8],
+    width: usize,
+    include_trailing_cursor_row: bool,
+) -> Vec<usize> {
+    let mut starts = wrapped_line_starts(bytes, width);
+    let total = line_display_width(bytes);
+    if include_trailing_cursor_row
+        && total > 0
+        && total.saturating_sub(starts.last().copied().unwrap_or(0)) >= width.max(1)
+    {
+        starts.push(total);
+    }
+    starts
+}
+
+fn visual_row_distance(
+    document: &Document,
+    top_row: usize,
+    top_segment: usize,
+    target_row: usize,
+    target_segment: usize,
+    width: usize,
+) -> usize {
+    if target_row < top_row {
+        return 0;
+    }
+    if target_row == top_row {
+        return target_segment.saturating_sub(top_segment);
+    }
+
+    let top_count = wrapped_line_starts(document.line(top_row).unwrap_or_default(), width).len();
+    let mut distance = top_count.saturating_sub(top_segment);
+    for row in top_row + 1..target_row {
+        distance = distance.saturating_add(
+            wrapped_line_starts(document.line(row).unwrap_or_default(), width).len(),
+        );
+    }
+    distance.saturating_add(target_segment)
+}
+
 fn render_text_with_selection(
     bytes: &[u8],
     document_offset: usize,
@@ -3786,12 +3981,23 @@ fn decimal_width(mut number: usize) -> usize {
     width
 }
 
-fn render_line_number(row: usize, exists: bool, width: usize) -> String {
+fn render_line_number(
+    row: usize,
+    exists: bool,
+    width: usize,
+    current_row: usize,
+    continuation: bool,
+) -> String {
     let number_width = width.saturating_sub(1);
-    if exists {
-        format!("{:>number_width$} ", row + 1)
+    if !exists || continuation {
+        format!("{:>number_width$} ", if exists { "" } else { "~" })
     } else {
-        format!("{:>number_width$} ", "~")
+        let number = if row == current_row {
+            row + 1
+        } else {
+            row.abs_diff(current_row)
+        };
+        format!("{:>number_width$} ", number)
     }
 }
 
@@ -5522,6 +5728,27 @@ mod tests {
     }
 
     #[test]
+    fn jumps_to_counted_lines_with_g_and_gg() {
+        let mut app = app_with(b"one\ntwo\nthree\nfour");
+
+        for key in [Key::Char('3'), Key::Char('G')] {
+            app.handle_key(key).unwrap();
+        }
+        assert_eq!(app.editor().position(), (2, 0));
+
+        for key in [Key::Char('2'), Key::Char('g'), Key::Char('g')] {
+            app.handle_key(key).unwrap();
+        }
+        assert_eq!(app.editor().position(), (1, 0));
+
+        app.handle_key(Key::Char('G')).unwrap();
+        assert_eq!(app.editor().position(), (3, 0));
+        app.handle_key(Key::Char('g')).unwrap();
+        app.handle_key(Key::Char('g')).unwrap();
+        assert_eq!(app.editor().position(), (0, 0));
+    }
+
+    #[test]
     fn each_split_selects_buffers_independently() {
         let mut editor = Editor::new(Document::new(PathBuf::from("one.txt"), b"one".to_vec()));
         editor.add_document(Document::new(PathBuf::from("two.txt"), b"two".to_vec()));
@@ -6114,8 +6341,86 @@ mod tests {
         assert!(frame.contains("one"));
         assert!(frame.contains("NORMAL"));
         assert!(frame.contains("1 one"));
-        assert!(frame.contains("2 你好"));
+        assert!(frame.contains("1 你好"));
         assert!(frame.ends_with("\x1b[2;3H\x1b[2 q\x1b[?25h"));
+    }
+
+    #[test]
+    fn renders_absolute_number_for_cursor_and_relative_numbers_elsewhere() {
+        let mut app = app_with(b"one\ntwo\nthree");
+        app.handle_key(Key::Char('j')).unwrap();
+        let frame = String::from_utf8(app.render(TerminalSize {
+            rows: 6,
+            columns: 20,
+        }))
+        .unwrap();
+
+        assert!(frame.contains("1 one"));
+        assert!(frame.contains("2 two"));
+        assert!(frame.contains("1 three"));
+    }
+
+    #[test]
+    fn wraps_long_editor_lines_and_places_the_cursor_on_the_wrapped_row() {
+        let mut app = app_with(b"abcdefghijklmnopqr");
+        let size = TerminalSize {
+            rows: 6,
+            columns: 10,
+        };
+        for _ in 0..12 {
+            app.handle_key(Key::Char('l')).unwrap();
+        }
+        let frame = String::from_utf8(app.render(size)).unwrap();
+
+        assert!(frame.contains("1 abcdefgh"));
+        assert!(frame.contains("  ijklmnop"));
+        assert!(frame.contains("  qr"));
+        assert!(frame.contains("\x1b[3;7H"));
+    }
+
+    #[test]
+    fn scrolls_within_a_line_that_wraps_beyond_the_viewport() {
+        let mut app = app_with(b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        for key in [Key::Char('5'), Key::Char('0'), Key::Char('l')] {
+            app.handle_key(key).unwrap();
+        }
+        let frame = String::from_utf8(app.render(TerminalSize {
+            rows: 6,
+            columns: 10,
+        }))
+        .unwrap();
+
+        assert_eq!(app.viewport().row_offset, 0);
+        assert_eq!(app.viewport().wrap_offset, 4);
+        assert!(frame.contains("\x1b[4;5H"));
+    }
+
+    #[test]
+    fn wraps_an_insert_cursor_after_an_exactly_full_row() {
+        let mut app = app_with(b"abcdefgh");
+        app.handle_key(Key::Char('A')).unwrap();
+        let frame = String::from_utf8(app.render(TerminalSize {
+            rows: 6,
+            columns: 10,
+        }))
+        .unwrap();
+
+        assert!(frame.contains("1 abcdefgh"));
+        assert!(frame.contains("\x1b[3;3H"));
+        assert!(frame.ends_with("\x1b[6 q\x1b[?25h"));
+    }
+
+    #[test]
+    fn wraps_editor_text_only_at_grapheme_boundaries() {
+        let mut app = app_with("ab好cd好ef".as_bytes());
+        let frame = String::from_utf8(app.render(TerminalSize {
+            rows: 6,
+            columns: 8,
+        }))
+        .unwrap();
+
+        assert!(frame.contains("1 ab好cd"));
+        assert!(frame.contains("  好ef"));
     }
 
     #[test]

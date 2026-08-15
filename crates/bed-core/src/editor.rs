@@ -728,6 +728,16 @@ impl Editor {
         self.view.preferred_column = None;
     }
 
+    /// Move to a 1-based document line, clamping outside values to the file.
+    pub fn move_to_line(&mut self, line: usize) {
+        let row = line
+            .saturating_sub(1)
+            .min(self.document().line_count().saturating_sub(1));
+        let offset = self.document().line_start_by_row(row).unwrap_or(0);
+        self.view.cursor.set_offset(offset);
+        self.view.preferred_column = None;
+    }
+
     pub fn move_to_last_line(&mut self) {
         let start = self.document().line_start(self.document().len());
         self.view.cursor.set_offset(start);
@@ -1725,6 +1735,18 @@ mod tests {
         assert!(editor.delete_char().is_some());
 
         assert_eq!(editor.document().as_bytes(), b"x");
+        assert_eq!(editor.position(), (0, 0));
+    }
+
+    #[test]
+    fn moves_to_one_based_lines_and_clamps() {
+        let mut editor = editor_with(b"one\ntwo\nthree");
+
+        editor.move_to_line(2);
+        assert_eq!(editor.position(), (1, 0));
+        editor.move_to_line(99);
+        assert_eq!(editor.position(), (2, 0));
+        editor.move_to_line(0);
         assert_eq!(editor.position(), (0, 0));
     }
 
