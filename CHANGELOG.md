@@ -22,6 +22,8 @@ All notable changes to bed are documented in this file.
 - Counted line jumps through `[count]gg` and `[count]G`.
 - Soft-wrapped editor lines with grapheme-safe visual rows, viewport scrolling,
   and absolute-current plus relative line numbers enabled by default.
+- Command mode can be opened directly from the file tree and returns focus to
+  the tree after execution or cancellation.
 
 ### Fixed
 

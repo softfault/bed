@@ -1835,6 +1835,7 @@ impl App {
             self.count.take().unwrap_or(1)
         };
         match key {
+            Key::Char(':') => self.enter_command_mode(None),
             Key::Escape | Key::Ctrl('c') | Key::Ctrl('n') | Key::Char('q') => {
                 self.mode = Mode::Normal;
             }
@@ -3344,7 +3345,9 @@ impl App {
 
     fn enter_command_mode(&mut self, selection: Option<SelectionKind>) {
         self.command_return_mode = match self.mode {
-            Mode::TerminalInput | Mode::TerminalNormal | Mode::TerminalVisual => self.mode,
+            Mode::Tree | Mode::TerminalInput | Mode::TerminalNormal | Mode::TerminalVisual => {
+                self.mode
+            }
             _ => Mode::Normal,
         };
         self.mode = Mode::Command;
@@ -6092,6 +6095,29 @@ mod tests {
         );
         assert_eq!(app.editor().document().as_bytes(), b"nested");
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn file_tree_can_open_commands_and_restore_tree_focus() {
+        let mut app = app_with(b"");
+        app.render(TerminalSize {
+            rows: 12,
+            columns: 80,
+        });
+        app.mode = Mode::Tree;
+
+        app.handle_key(Key::Char(':')).unwrap();
+        assert_eq!(app.mode(), Mode::Command);
+        for character in "treewidth 15".chars() {
+            app.handle_key(Key::Char(character)).unwrap();
+        }
+        app.handle_key(Key::Enter).unwrap();
+        assert_eq!(app.mode(), Mode::Tree);
+        assert_eq!(app.file_tree_width(), 15);
+
+        app.handle_key(Key::Char(':')).unwrap();
+        app.handle_key(Key::Escape).unwrap();
+        assert_eq!(app.mode(), Mode::Tree);
     }
 
     #[test]

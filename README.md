@@ -169,6 +169,7 @@ On terminals at least 40 columns wide, bed keeps a file tree at the left edge. I
 - `[count] Ctrl-W |`: set its width exactly; without a count, maximize it
 - `Ctrl-W =`: restore the default file tree width
 - `r`: refresh the tree
+- `:`: enter command mode while keeping the tree focused
 - `Escape` or `q`: return to the editor
 - `:tree [PATH]`: focus the tree and optionally change its root
 - `:treewidth N`: set the file tree width to at least 10 columns
