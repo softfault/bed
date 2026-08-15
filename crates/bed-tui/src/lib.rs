@@ -2222,8 +2222,14 @@ impl App {
             let state = session
                 .status()
                 .map_or_else(|| "running".to_owned(), |status| format!("exited {status}"));
+            let view_count = self
+                .terminal_views
+                .values()
+                .filter(|view| view.session_id == id)
+                .count();
+            let view_label = if view_count == 1 { "view" } else { "views" };
             self.message.push_str(&format!(
-                "{}:{marker} {} [{state}]",
+                "{}:{marker} {} [{state}; {view_count} {view_label}]",
                 id.get(),
                 session.command()
             ));
@@ -2272,7 +2278,7 @@ impl App {
             .count();
         if view_count > 0 {
             self.message.push_str(&format!(
-                "Terminal session {value} still has {view_count} view(s); close them first"
+                "Terminal session {value} still has {view_count} view(s); close each with :close first"
             ));
             return;
         }
@@ -4451,10 +4457,13 @@ mod tests {
 
         execute(&mut app, "terminals");
         assert!(app.message.contains(&format!("{}: ", session_id.get())));
+        assert!(app.message.contains("0 views"));
         assert!(app.message.contains("[exited"));
         execute(&mut app, &format!("terminalattach {}", session_id.get()));
         assert_eq!(app.mode(), Mode::TerminalNormal);
         assert_eq!(app.active_terminal_session_id(), Some(session_id));
+        execute(&mut app, "terminals");
+        assert!(app.message.contains("1 view]"));
         execute(&mut app, &format!("terminalclose {}", session_id.get()));
         assert!(app.message.contains("still has 1 view(s)"));
         app.close_active_window();

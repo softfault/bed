@@ -125,9 +125,9 @@ Commands:
 - `:tabmove N`: move the current tab to 1-based position `N`
 - `:tabclose` / `:tabonly`: close the current tab page or all other tab pages
 - `:terminal [COMMAND]`: open a shell or command in a new terminal split
-- `:terminals`: list terminal sessions by stable ID
-- `:terminalattach ID`: attach another view to an existing session
-- `:terminalclose ID`: remove an exited detached session; append `!` to terminate a running one
+- `:terminals`: list terminal sessions by stable ID, state, and current view count
+- `:terminalattach ID`: open another view of an existing session; this does not create a new session
+- `:terminalclose ID`: remove an exited session after every view has been closed with `:close`; append `!` to terminate a running one
 - `:q`: quit if no open buffer has unsaved changes
 - `:q!`: discard all changes and quit
 - `:wq` or `:x`: save the current buffer and quit if every buffer is clean
