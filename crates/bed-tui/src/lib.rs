@@ -15,8 +15,8 @@ mod layout;
 
 use anyhow::{Context, Result};
 use bed_core::{
-    BufferId, Document, Editor, RegexPattern, SelectionKind, SubstituteOptions, SubstituteRange,
-    ViewId,
+    BufferId, Document, Editor, LineShift, RegexPattern, SelectionKind, SubstituteOptions,
+    SubstituteRange, ViewId,
 };
 use bed_terminal::{Key, MouseEvent, SpecialKey, TerminalSize};
 use bed_terminal_session::{TerminalSessionId, TerminalStore};
@@ -65,6 +65,8 @@ enum Pending {
     Go,
     Delete,
     Yank,
+    ShiftLeft,
+    ShiftRight,
     Window,
 }
 
@@ -112,6 +114,7 @@ enum Command<'a> {
     TreeWidth(Option<&'a str>),
     RefreshTree,
     Terminal(Option<&'a str>),
+    External(Option<&'a str>),
     ListTerminals,
     AttachTerminal(Option<&'a str>),
     CloseTerminal {
@@ -1408,6 +1411,16 @@ impl App {
                     self.yank_line_end();
                     return Ok(());
                 }
+                (Pending::ShiftLeft, Key::Char('<')) => {
+                    let count = self.count.take().unwrap_or(1);
+                    self.editor.shift_current_lines(count, LineShift::Left);
+                    return Ok(());
+                }
+                (Pending::ShiftRight, Key::Char('>')) => {
+                    let count = self.count.take().unwrap_or(1);
+                    self.editor.shift_current_lines(count, LineShift::Right);
+                    return Ok(());
+                }
                 (Pending::Go, Key::Char('g')) => {
                     let line = self.count.take().unwrap_or(1);
                     self.editor.move_to_line(line);
@@ -1456,7 +1469,12 @@ impl App {
         let explicit_count = self.count.is_some();
         let count = if matches!(
             key,
-            Key::Char('g') | Key::Char('d') | Key::Char('y') | Key::Ctrl('w')
+            Key::Char('g')
+                | Key::Char('d')
+                | Key::Char('y')
+                | Key::Char('<')
+                | Key::Char('>')
+                | Key::Ctrl('w')
         ) {
             1
         } else {
@@ -1517,6 +1535,8 @@ impl App {
             Key::Char('V') => self.enter_visual(SelectionKind::Line),
             Key::Char('d') => self.pending = Some(Pending::Delete),
             Key::Char('y') => self.pending = Some(Pending::Yank),
+            Key::Char('<') => self.pending = Some(Pending::ShiftLeft),
+            Key::Char('>') => self.pending = Some(Pending::ShiftRight),
             Key::Char('x') | Key::Delete | Key::Modified(SpecialKey::Delete, _) => {
                 if self.editor.can_delete_char() {
                     self.editor.checkpoint();
@@ -1694,6 +1714,12 @@ impl App {
             Key::Char('y') => self.yank_visual(kind),
             Key::Char('d') | Key::Char('x') | Key::Delete => self.delete_visual(kind),
             Key::Char('p') | Key::Char('P') => self.put_over_visual(kind)?,
+            Key::Char('<') => {
+                self.editor.shift_selected_lines(LineShift::Left);
+            }
+            Key::Char('>') => {
+                self.editor.shift_selected_lines(LineShift::Right);
+            }
             Key::Char(':') => self.enter_command_mode(Some(kind)),
             _ => {}
         }
@@ -1956,6 +1982,8 @@ impl App {
             Command::TreeWidth(None) => self.message.push_str("File tree width required"),
             Command::RefreshTree => self.refresh_tree(),
             Command::Terminal(command) => self.open_terminal(command),
+            Command::External(Some(command)) => self.open_terminal(Some(command)),
+            Command::External(None) => self.message.push_str("Shell command required"),
             Command::ListTerminals => self.list_terminal_sessions(),
             Command::AttachTerminal(Some(id)) => self.attach_terminal_id(id),
             Command::AttachTerminal(None) => self.message.push_str("Terminal session ID required"),
@@ -3545,6 +3573,12 @@ impl App {
 }
 
 fn parse_command(input: &str) -> Command<'_> {
+    if let Some(command) = input.strip_prefix('!') {
+        return Command::External({
+            let command = command.trim();
+            (!command.is_empty()).then_some(command)
+        });
+    }
     if let Some(command) = parse_substitute_command(input) {
         return command;
     }
@@ -4366,9 +4400,9 @@ fn push_sgr_color(parameters: &mut Vec<String>, color: Color, foreground: bool) 
 mod tests {
     use super::{
         App, Command, DEFAULT_FILE_TREE_WIDTH, Mode, ParsedSubstitute, SplitAxis, TerminalPosition,
-        TerminalSelection, anchored_terminal_scrollback, display_width, move_terminal_position,
-        parse_command, parse_substitute_expression, render_terminal_row, render_text,
-        render_text_with_selection, sgr_attributes, shift_terminal_selection,
+        TerminalSelection, WindowContent, anchored_terminal_scrollback, display_width,
+        move_terminal_position, parse_command, parse_substitute_expression, render_terminal_row,
+        render_text, render_text_with_selection, sgr_attributes, shift_terminal_selection,
         terminal_display_column, terminal_live_position, terminal_selection_bounds,
         terminal_selection_text,
     };
@@ -4580,6 +4614,15 @@ mod tests {
             Command::Terminal(Some("printf ready"))
         );
         assert_eq!(parse_command("te"), Command::Unknown("te"));
+        assert_eq!(
+            parse_command("! printf ready"),
+            Command::External(Some("printf ready"))
+        );
+        assert_eq!(
+            parse_command("!printf ready"),
+            Command::External(Some("printf ready"))
+        );
+        assert_eq!(parse_command("!"), Command::External(None));
         assert_eq!(parse_command("terminals"), Command::ListTerminals);
         assert_eq!(
             parse_command("terminalattach 12"),
@@ -4679,6 +4722,25 @@ mod tests {
         execute(&mut app, &format!("terminalclose {}", session_id.get()));
         assert!(app.terminals.get(session_id).is_none());
         assert!(app.message.contains("closed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bang_command_opens_a_terminal_split() {
+        let mut app = app_with(b"text");
+        app.render(TerminalSize {
+            rows: 20,
+            columns: 80,
+        });
+
+        execute(&mut app, "! printf ready");
+
+        assert_eq!(app.mode(), Mode::TerminalInput);
+        assert_eq!(app.layout.windows().len(), 2);
+        assert!(matches!(
+            app.active_window().content,
+            WindowContent::Terminal(_)
+        ));
     }
 
     #[cfg(unix)]
@@ -5273,6 +5335,26 @@ mod tests {
     }
 
     #[test]
+    fn visual_shifts_keep_the_selection_and_undo_as_one_change() {
+        let mut app = app_with(b"one\n  two\nthree");
+        app.handle_key(Key::Char('V')).unwrap();
+        app.handle_key(Key::Char('j')).unwrap();
+
+        app.handle_key(Key::Char('>')).unwrap();
+
+        assert_eq!(app.mode(), Mode::VisualLine);
+        assert!(app.editor().view().selection_anchor().is_some());
+        assert_eq!(
+            app.editor().document().as_bytes(),
+            b"    one\n      two\nthree"
+        );
+
+        app.handle_key(Key::Escape).unwrap();
+        app.handle_key(Key::Char('u')).unwrap();
+        assert_eq!(app.editor().document().as_bytes(), b"one\n  two\nthree");
+    }
+
+    #[test]
     fn visual_put_replaces_selection_and_keeps_deleted_text_in_the_register() {
         let mut app = app_with(b"one two");
         for key in [Key::Char('v'), Key::Char('e'), Key::Char('y')] {
@@ -5379,6 +5461,24 @@ mod tests {
         assert_eq!(app.editor().document().as_bytes(), b"two");
         app.handle_key(Key::Char('u')).unwrap();
         assert_eq!(app.editor().document().as_bytes(), b"one\ntwo");
+    }
+
+    #[test]
+    fn shifts_counted_normal_lines_in_both_directions() {
+        let mut app = app_with(b"one\n  two\nthree");
+
+        for key in [Key::Char('2'), Key::Char('>'), Key::Char('>')] {
+            app.handle_key(key).unwrap();
+        }
+        assert_eq!(
+            app.editor().document().as_bytes(),
+            b"    one\n      two\nthree"
+        );
+
+        for key in [Key::Char('2'), Key::Char('<'), Key::Char('<')] {
+            app.handle_key(key).unwrap();
+        }
+        assert_eq!(app.editor().document().as_bytes(), b"one\n  two\nthree");
     }
 
     #[test]

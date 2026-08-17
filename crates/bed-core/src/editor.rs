@@ -24,6 +24,12 @@ pub enum SubstituteRange {
     Buffer,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LineShift {
+    Left,
+    Right,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SubstituteOptions {
     pub global: bool,
@@ -289,6 +295,22 @@ impl Editor {
         self.view.cursor_mut().set_offset(cursor);
         self.view.set_preferred_column(None);
         true
+    }
+
+    pub fn shift_current_lines(&mut self, count: usize, direction: LineShift) -> bool {
+        let first_row = self.position().0;
+        self.shift_line_range(first_row, count.max(1), direction)
+    }
+
+    pub fn shift_selected_lines(&mut self, direction: LineShift) -> bool {
+        let Some(anchor) = self.view.selection_anchor else {
+            return false;
+        };
+        let anchor_row = self.document().row_for_offset(anchor);
+        let cursor_row = self.document().row_for_offset(self.view.cursor.offset());
+        let first_row = anchor_row.min(cursor_row);
+        let count = anchor_row.abs_diff(cursor_row) + 1;
+        self.shift_line_range(first_row, count, direction)
     }
 
     pub fn insert(&mut self, byte: u8) -> Result<()> {
@@ -1045,6 +1067,90 @@ impl Editor {
         self.normalize_normal_cursor();
         Some(deleted)
     }
+
+    fn shift_line_range(&mut self, first_row: usize, count: usize, direction: LineShift) -> bool {
+        const INDENT: &[u8] = b"    ";
+
+        let line_count = self.document().line_count();
+        if first_row >= line_count {
+            return false;
+        }
+        let end_row = first_row
+            .saturating_add(count)
+            .min(line_count)
+            .max(first_row + 1);
+        let mut edits = Vec::with_capacity(end_row - first_row);
+        for row in first_row..end_row {
+            let start = self
+                .document()
+                .line_start_by_row(row)
+                .expect("bounded row must have a line start");
+            let end = self.document().line_end(start);
+            match direction {
+                LineShift::Right if start < end => edits.push((start, 0usize, INDENT.len())),
+                LineShift::Right => {}
+                LineShift::Left => {
+                    let line = &self.document().as_bytes()[start..end];
+                    let removed = if line.first() == Some(&b'\t') {
+                        1
+                    } else {
+                        line.iter()
+                            .take(INDENT.len())
+                            .take_while(|&&byte| byte == b' ')
+                            .count()
+                    };
+                    if removed > 0 {
+                        edits.push((start, removed, 0));
+                    }
+                }
+            }
+        }
+        if edits.is_empty() {
+            return false;
+        }
+
+        self.checkpoint();
+        let mut cursor = self.view.cursor.offset();
+        let mut anchor = self.view.selection_anchor;
+        for &(start, removed, inserted) in edits.iter().rev() {
+            if removed > 0 {
+                let end = start + removed;
+                self.document_mut()
+                    .delete_range(start..end)
+                    .expect("validated indentation must be deletable");
+                cursor = offset_after_deletion(cursor, start, end);
+                anchor = anchor.map(|offset| offset_after_deletion(offset, start, end));
+            } else {
+                self.document_mut()
+                    .insert_bytes(start, INDENT)
+                    .expect("line starts are valid insertion offsets");
+                cursor = offset_after_insertion(cursor, start, inserted);
+                anchor = anchor.map(|offset| offset_after_insertion(offset, start, inserted));
+            }
+        }
+        self.view.cursor.set_offset(cursor);
+        self.view.selection_anchor = anchor;
+        self.view.preferred_column = None;
+        true
+    }
+}
+
+fn offset_after_insertion(offset: usize, start: usize, inserted: usize) -> usize {
+    if offset >= start {
+        offset.saturating_add(inserted)
+    } else {
+        offset
+    }
+}
+
+fn offset_after_deletion(offset: usize, start: usize, end: usize) -> usize {
+    if offset >= end {
+        offset - (end - start)
+    } else if offset > start {
+        start
+    } else {
+        offset
+    }
 }
 
 fn next_grapheme_offset(bytes: &[u8], offset: usize) -> usize {
@@ -1224,7 +1330,7 @@ fn lexical_absolute(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{Editor, SubstituteOptions, SubstituteRange};
+    use super::{Editor, LineShift, SubstituteOptions, SubstituteRange};
     use crate::{Document, RegexPattern, SelectionKind};
     use std::{
         fs,
@@ -1485,6 +1591,54 @@ mod tests {
         assert!(editor.undo());
         assert_eq!(editor.document().as_bytes(), b"one\ntwo\nthree");
         assert_eq!(editor.position(), (1, 0));
+    }
+
+    #[test]
+    fn shifts_counted_lines_as_one_undoable_change() {
+        let mut editor = editor_with(b"one\n  two\n\tthree\nfour");
+        assert!(editor.move_down(false));
+
+        assert!(editor.shift_current_lines(2, LineShift::Right));
+        assert_eq!(
+            editor.document().as_bytes(),
+            b"one\n      two\n    \tthree\nfour"
+        );
+        assert_eq!(editor.position(), (1, 4));
+
+        assert!(editor.undo());
+        assert_eq!(editor.document().as_bytes(), b"one\n  two\n\tthree\nfour");
+        assert_eq!(editor.position(), (1, 0));
+    }
+
+    #[test]
+    fn shifts_selected_lines_and_preserves_the_selection() {
+        let mut editor = editor_with(b"one\n  two\nthree");
+        editor.begin_selection();
+        assert!(editor.move_down(false));
+
+        assert!(editor.shift_selected_lines(LineShift::Right));
+        assert_eq!(editor.document().as_bytes(), b"    one\n      two\nthree");
+        assert_eq!(editor.position(), (1, 4));
+        assert!(editor.view().selection_anchor().is_some());
+
+        assert!(editor.shift_selected_lines(LineShift::Left));
+        assert_eq!(editor.document().as_bytes(), b"one\n  two\nthree");
+        assert_eq!(editor.position(), (1, 0));
+        assert!(editor.view().selection_anchor().is_some());
+    }
+
+    #[test]
+    fn unindents_tabs_and_spaces_without_clearing_redo_on_a_noop() {
+        let mut editor = editor_with(b"    one\n  two\n\tthree\nfour");
+        assert!(editor.shift_current_lines(3, LineShift::Left));
+        assert_eq!(editor.document().as_bytes(), b"one\ntwo\nthree\nfour");
+
+        editor.checkpoint();
+        editor.insert(b'!').unwrap();
+        assert!(editor.undo());
+        assert!(!editor.shift_current_lines(3, LineShift::Left));
+        assert!(editor.redo());
+        assert_eq!(editor.document().as_bytes(), b"!one\ntwo\nthree\nfour");
     }
 
     #[test]

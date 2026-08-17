@@ -4,7 +4,12 @@ All notable changes to bed are documented in this file.
 
 ## [Unreleased]
 
-Changes after the 0.4.0 release will be collected here.
+### Added
+
+- Run external commands in retained, non-blocking terminal splits through
+  `:! COMMAND`.
+- Shift Visual selections with `<` and `>`, or counted Normal-mode lines with
+  `<<` and `>>`, using one undoable four-space indentation level per operation.
 
 ## [0.4.0] - 2026-08-17
 

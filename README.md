@@ -39,6 +39,7 @@ Normal mode:
 - `i a I A`, `o O`: enter insert mode
 - `x`, `dd`, `dw`, `d$`: delete character, line, word, or to line end
 - `yy`, `yw`, `y$`, `p`, `P`: yank and put characterwise or linewise text
+- `[count]<<` / `[count]>>`: unindent or indent the current and following logical lines by one four-space level
 - `/PATTERN`, `n`, `N`: regular-expression search, repeat forward, repeat backward
 - `v` / `V`: start character or line selection
 - `u`, `Ctrl-R`: undo and redo
@@ -67,6 +68,7 @@ Visual modes:
 - Use Normal-mode motions and counts to extend a character or line selection
 - `y`: yank the selection; `d`, `x`, or `Delete`: delete it
 - `p` / `P`: replace the selection with the register and retain the replaced text
+- `<` / `>`: unindent or indent every selected logical line by one four-space level and keep the selection active
 - `v` / `V`: switch selection kind; repeat the active key, `Escape`, or `Ctrl-C` to leave Visual mode
 - `:s/PATTERN/REPLACEMENT/[FLAGS]`: substitute on the selected lines
 
@@ -129,6 +131,7 @@ Commands:
 - `:tabnext [N]` / `:tabprevious`: switch tab pages, optionally selecting 1-based position `N`
 - `:tabmove N`: move the current tab to 1-based position `N`
 - `:tabclose` / `:tabonly`: close the current tab page or all other tab pages
+- `:! COMMAND`: run an external command in a new terminal split and retain its output after exit
 - `:terminal [COMMAND]`: open a shell or command in a new terminal split
 - `:terminals`: list terminal sessions by stable ID, state, and current view count
 - `:terminalattach ID`: open another view of an existing session; this does not create a new session
