@@ -4,6 +4,24 @@ All notable changes to bed are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Watch the parent directories of every open file and automatically reload
+  clean buffers after external writes or atomic replacements.
+- Preserve dirty buffers that change externally and files deleted on disk,
+  marking them persistently as `[conflict]` or `[deleted]` until resolved.
+- Keep the active file tree synchronized with external create, delete, and
+  rename operations through bounded native filesystem notifications.
+- Use `H` to make the parent directory the tree root and `L` to make the
+  selected directory the root.
+
+### Changed
+
+- Load the tree root and visible expanded directories on a bounded background
+  worker instead of recursively scanning them on the UI thread.
+- Develop and test bed with the latest stable Rust toolchain. The workspace
+  minimum is Rust 1.88, required by `notify 9.0.0-rc.4`.
+
 ## [0.4.1] - 2026-08-17
 
 ### Added

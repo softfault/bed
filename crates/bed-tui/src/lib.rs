@@ -11,19 +11,24 @@
 #![forbid(unsafe_code)]
 
 mod file_tree;
+mod filesystem;
 mod layout;
 
 use anyhow::{Context, Result};
 use bed_core::{
-    BufferId, Document, Editor, LineShift, RegexPattern, SelectionKind, SubstituteOptions,
-    SubstituteRange, ViewId,
+    BufferId, DiskReconcile, Document, Editor, ExternalState, LineShift, RegexPattern,
+    SelectionKind, SubstituteOptions, SubstituteRange, ViewId,
 };
 use bed_terminal::{Key, MouseEvent, SpecialKey, TerminalSize};
 use bed_terminal_session::{TerminalSessionId, TerminalStore};
 use bed_vt100::{Attributes, Color, Row, Screen};
 use file_tree::{FileTree, TreeEntryKind};
+use filesystem::{DirectoryScanner, FileSystemWatcher, ScanResult, absolute_path};
 use layout::{Direction, Layout, Rect, ResizeAmount, SplitAxis, WindowId, window_in_direction};
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::{HashMap, HashSet},
+    path::{Path, PathBuf},
+};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -223,6 +228,8 @@ impl Default for Viewport {
 #[derive(Debug)]
 pub struct App {
     editor: Editor,
+    filesystem_watcher: Option<FileSystemWatcher>,
+    directory_scanner: Option<DirectoryScanner>,
     terminals: TerminalStore,
     terminal_views: HashMap<TerminalViewId, TerminalView>,
     next_terminal_view_id: u64,
@@ -271,8 +278,25 @@ impl App {
             active_window,
             Window::new(editor.buffer_id(), editor.view_id(), Viewport::default()),
         )]);
+        let mut message = String::from("i: insert  :w: save  :q: quit");
+        let filesystem_watcher = match FileSystemWatcher::new() {
+            Ok(watcher) => Some(watcher),
+            Err(error) => {
+                message.push_str(&format!("; filesystem watcher unavailable: {error}"));
+                None
+            }
+        };
+        let directory_scanner = match DirectoryScanner::new() {
+            Ok(scanner) => Some(scanner),
+            Err(error) => {
+                message.push_str(&format!("; directory scanner unavailable: {error}"));
+                None
+            }
+        };
         Self {
             editor,
+            filesystem_watcher,
+            directory_scanner,
             terminals: TerminalStore::new(),
             terminal_views: HashMap::new(),
             next_terminal_view_id: 0,
@@ -281,7 +305,7 @@ impl App {
             command_selection: None,
             search: String::new(),
             last_search: None,
-            message: String::from("i: insert  :w: save  :q: quit"),
+            message,
             pending: None,
             count: None,
             register: None,
@@ -890,6 +914,63 @@ impl App {
         self.should_quit
     }
 
+    pub fn poll_filesystem(&mut self) -> Result<bool> {
+        let watched_directories = self.watched_directories();
+        if let Some(watcher) = &mut self.filesystem_watcher {
+            for error in watcher.sync(watched_directories) {
+                self.push_background_message(&format!("Watch failed: {error}"));
+            }
+        }
+
+        let batch = self
+            .filesystem_watcher
+            .as_ref()
+            .map(FileSystemWatcher::drain)
+            .unwrap_or_default();
+        let mut redraw = false;
+        for error in batch.errors {
+            self.push_background_message(&format!("Watch failed: {error}"));
+            redraw = true;
+        }
+
+        if batch.overflowed {
+            self.file_tree.refresh()?;
+            redraw = true;
+        } else {
+            redraw |= self
+                .file_tree
+                .invalidate_paths(batch.paths.iter().map(PathBuf::as_path));
+        }
+        redraw |= self.reconcile_changed_buffers(&batch.paths, batch.overflowed);
+
+        let scan_results = self
+            .directory_scanner
+            .as_mut()
+            .map(DirectoryScanner::drain)
+            .unwrap_or_default();
+        for ScanResult { key, entries } in scan_results {
+            let outcome = self
+                .file_tree_for_tab_mut(key.tab)
+                .map(|tree| tree.apply_scan(&key, entries));
+            match outcome {
+                Some(Ok(changed)) => redraw |= changed,
+                Some(Err(error)) => {
+                    self.push_background_message(&format!("Tree failed: {error}"));
+                    redraw = true;
+                }
+                None => {}
+            }
+        }
+
+        let requests = self.file_tree.scan_requests(self.active_tab_id.0);
+        if let Some(scanner) = &mut self.directory_scanner {
+            for request in requests {
+                scanner.request(request);
+            }
+        }
+        Ok(redraw)
+    }
+
     pub fn poll_terminals(&mut self) -> Result<bool> {
         let previous_history: HashMap<_, _> = self
             .terminals
@@ -995,6 +1076,97 @@ impl App {
             self.enter_terminal_normal();
         }
         Ok(!activity.is_empty())
+    }
+
+    fn watched_directories(&self) -> HashSet<PathBuf> {
+        let mut directories = self.file_tree.watched_directories();
+        for &buffer_id in self.editor.buffer_ids() {
+            let Some(document) = self
+                .editor
+                .buffers()
+                .get(buffer_id)
+                .map(|buffer| buffer.document())
+            else {
+                continue;
+            };
+            if document.is_file_backed()
+                && let Some(parent) = document.path().parent()
+            {
+                directories.insert(parent.to_path_buf());
+            }
+        }
+        directories
+    }
+
+    fn reconcile_changed_buffers(&mut self, paths: &HashSet<PathBuf>, all: bool) -> bool {
+        let buffer_ids: Vec<_> = self.editor.buffer_ids().to_vec();
+        let mut redraw = false;
+        for buffer_id in buffer_ids {
+            let Some(document) = self
+                .editor
+                .buffers()
+                .get(buffer_id)
+                .map(|buffer| buffer.document())
+            else {
+                continue;
+            };
+            if !document.is_file_backed()
+                || (!all
+                    && !paths
+                        .iter()
+                        .any(|event| event_affects_path(event, document.path())))
+            {
+                continue;
+            }
+            let path = document.path().to_path_buf();
+            match self.editor.reconcile_buffer_disk(buffer_id) {
+                Ok(DiskReconcile::Unchanged | DiskReconcile::Reconciled) => {}
+                Ok(DiskReconcile::Reloaded) => {
+                    self.push_background_message(&format!("{} reloaded", path.display()));
+                    redraw = true;
+                }
+                Ok(DiskReconcile::Conflict) => {
+                    self.push_background_message(&format!(
+                        "{} changed on disk; local edits preserved",
+                        path.display()
+                    ));
+                    redraw = true;
+                }
+                Ok(DiskReconcile::Deleted) => {
+                    self.push_background_message(&format!(
+                        "{} deleted on disk; buffer preserved",
+                        path.display()
+                    ));
+                    redraw = true;
+                }
+                Err(error) => {
+                    self.push_background_message(&format!(
+                        "Failed to refresh {}: {error:#}",
+                        path.display()
+                    ));
+                    redraw = true;
+                }
+            }
+        }
+        redraw
+    }
+
+    fn file_tree_for_tab_mut(&mut self, tab: u64) -> Option<&mut FileTree> {
+        if self.active_tab_id.0 == tab {
+            return Some(&mut self.file_tree);
+        }
+        self.parked_tabs
+            .iter_mut()
+            .flatten()
+            .find(|page| page.id.0 == tab)
+            .map(|page| &mut page.file_tree)
+    }
+
+    fn push_background_message(&mut self, message: &str) {
+        if !self.message.is_empty() {
+            self.message.push_str("; ");
+        }
+        self.message.push_str(message);
     }
 
     fn active_terminal_view_id(&self) -> Option<TerminalViewId> {
@@ -1860,6 +2032,7 @@ impl App {
         } else {
             self.count.take().unwrap_or(1)
         };
+        let previous_root = self.file_tree.root().to_path_buf();
         match key {
             Key::Char(':') => self.enter_command_mode(None),
             Key::Escape | Key::Ctrl('c') | Key::Ctrl('n') | Key::Char('q') => {
@@ -1877,6 +2050,16 @@ impl App {
             }
             Key::Char('h') | Key::ArrowLeft => {
                 if let Err(error) = self.file_tree.collapse() {
+                    self.message.push_str(&format!("Tree failed: {error}"));
+                }
+            }
+            Key::Char('H') => {
+                if let Err(error) = self.file_tree.set_parent_as_root() {
+                    self.message.push_str(&format!("Tree failed: {error}"));
+                }
+            }
+            Key::Char('L') => {
+                if let Err(error) = self.file_tree.set_selected_as_root() {
                     self.message.push_str(&format!("Tree failed: {error}"));
                 }
             }
@@ -1898,6 +2081,9 @@ impl App {
             }
             Key::Ctrl('w') => self.pending = Some(Pending::Window),
             _ => {}
+        }
+        if self.file_tree.root() != previous_root {
+            self.active_tab_automatic_title = self.file_tree.root_label();
         }
     }
 
@@ -2122,7 +2308,7 @@ impl App {
             .get(buffer_id)
             .expect("buffer order references a missing buffer")
             .document()
-            .is_dirty();
+            .has_unsaved_changes();
         if dirty && !force {
             self.message
                 .push_str("No write since last change (use :bdelete! to discard)");
@@ -2193,11 +2379,7 @@ impl App {
                 .get(buffer_id)
                 .expect("buffer order references a missing buffer");
             let current = if buffer_id == active { '%' } else { ' ' };
-            let dirty = if buffer.document().is_dirty() {
-                " [+]"
-            } else {
-                ""
-            };
+            let dirty = document_state_suffix(buffer.document());
             self.message.push_str(&format!(
                 "{}:{current} {}{dirty}",
                 index + 1,
@@ -2572,7 +2754,7 @@ impl App {
                 .get(buffer_id)
                 .expect("editor view references a missing buffer")
                 .document()
-                .is_dirty()
+                .has_unsaved_changes()
         })
     }
 
@@ -3543,11 +3725,7 @@ impl App {
             (true, Mode::TerminalVisual) => "TERMINAL VISUAL",
             (false, _) => "",
         };
-        let dirty = if self.editor.document().is_dirty() {
-            " [+]"
-        } else {
-            ""
-        };
+        let dirty = document_state_suffix(self.editor.document());
         let left = format!(
             " {mode}  [{}/{}] {}{dirty}",
             self.editor.buffer_number(),
@@ -3790,6 +3968,22 @@ fn document_label(document: &Document) -> String {
         .unwrap_or_else(|| document.path().as_os_str())
         .to_string_lossy()
         .into_owned()
+}
+
+fn document_state_suffix(document: &Document) -> &'static str {
+    match document.external_state() {
+        ExternalState::Modified => " [conflict]",
+        ExternalState::Deleted => " [deleted]",
+        ExternalState::InSync if document.is_dirty() => " [+]",
+        ExternalState::InSync => "",
+    }
+}
+
+fn event_affects_path(event: &Path, path: &Path) -> bool {
+    let Ok(path) = absolute_path(path) else {
+        return false;
+    };
+    event == path || path.parent().is_some_and(|parent| event == parent)
 }
 
 fn render_text(bytes: &[u8], column_offset: usize, width: usize) -> String {
@@ -4400,18 +4594,23 @@ fn push_sgr_color(parameters: &mut Vec<String>, color: Color, foreground: bool) 
 mod tests {
     use super::{
         App, Command, DEFAULT_FILE_TREE_WIDTH, Mode, ParsedSubstitute, SplitAxis, TerminalPosition,
-        TerminalSelection, WindowContent, anchored_terminal_scrollback, display_width,
-        move_terminal_position, parse_command, parse_substitute_expression, render_terminal_row,
-        render_text, render_text_with_selection, sgr_attributes, shift_terminal_selection,
-        terminal_display_column, terminal_live_position, terminal_selection_bounds,
-        terminal_selection_text,
+        TerminalSelection, anchored_terminal_scrollback, display_width, move_terminal_position,
+        parse_command, parse_substitute_expression, render_terminal_row, render_text,
+        render_text_with_selection, sgr_attributes, shift_terminal_selection,
+        terminal_display_column, terminal_selection_bounds, terminal_selection_text,
     };
-    use bed_core::{Document, Editor, SelectionKind, SubstituteOptions, SubstituteRange};
+    #[cfg(unix)]
+    use super::{WindowContent, terminal_live_position};
+    use bed_core::{
+        Document, Editor, ExternalState, SelectionKind, SubstituteOptions, SubstituteRange,
+    };
     use bed_terminal::{Key, TerminalSize};
     use bed_vt100::{Attributes, Color, TerminalEmulator};
     use std::{
         path::PathBuf,
         sync::atomic::{AtomicUsize, Ordering},
+        thread,
+        time::Duration,
     };
 
     static NEXT_TEST_FILE: AtomicUsize = AtomicUsize::new(0);
@@ -4421,6 +4620,17 @@ mod tests {
             PathBuf::from("test.txt"),
             bytes.to_vec(),
         )))
+    }
+
+    fn poll_filesystem_until(app: &mut App, condition: impl Fn(&App) -> bool) {
+        for _ in 0..200 {
+            app.poll_filesystem().unwrap();
+            if condition(app) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        panic!("filesystem state did not settle before the test timeout");
     }
 
     #[test]
@@ -6181,9 +6391,11 @@ mod tests {
         });
 
         execute(&mut app, &format!("tree {}", root.display()));
+        poll_filesystem_until(&mut app, |app| app.file_tree.entries().len() == 3);
         assert_eq!(app.mode(), Mode::Tree);
         app.handle_key(Key::Char('j')).unwrap();
         app.handle_key(Key::Char('l')).unwrap();
+        poll_filesystem_until(&mut app, |app| app.file_tree.entries().len() == 4);
         assert_eq!(app.file_tree.entries().len(), 4);
         app.handle_key(Key::Char('j')).unwrap();
         app.handle_key(Key::Enter).unwrap();
@@ -6364,7 +6576,7 @@ mod tests {
         std::fs::write(&path, b"original").unwrap();
         let mut editor = Editor::open(path.clone()).unwrap();
         editor.insert_bytes(b" edited").unwrap();
-        std::fs::write(&path, b"external").unwrap();
+        bed_file::atomic_write(&path, b"external").unwrap();
         let mut app = App::new(editor);
 
         execute(&mut app, "w");
@@ -6375,6 +6587,105 @@ mod tests {
         assert!(app.message.contains("written"));
         assert_eq!(std::fs::read(&path).unwrap(), b" editedoriginal");
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn reloads_clean_open_buffers_after_external_writes() {
+        let path = std::env::temp_dir().join(format!(
+            "bed-watch-clean-{}-{}.txt",
+            std::process::id(),
+            NEXT_TEST_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, b"original").unwrap();
+        let mut app = App::new(Editor::open(path.clone()).unwrap());
+        app.poll_filesystem().unwrap();
+
+        bed_file::atomic_write(&path, b"external").unwrap();
+        poll_filesystem_until(&mut app, |app| {
+            app.editor().document().as_bytes() == b"external"
+        });
+
+        assert_eq!(
+            app.editor().document().external_state(),
+            ExternalState::InSync
+        );
+        assert!(!app.editor().document().has_unsaved_changes());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn preserves_dirty_open_buffers_after_external_writes() {
+        let path = std::env::temp_dir().join(format!(
+            "bed-watch-conflict-{}-{}.txt",
+            std::process::id(),
+            NEXT_TEST_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, b"original").unwrap();
+        let mut editor = Editor::open(path.clone()).unwrap();
+        editor.insert_bytes(b"local ").unwrap();
+        let mut app = App::new(editor);
+        app.poll_filesystem().unwrap();
+
+        std::fs::write(&path, b"external").unwrap();
+        poll_filesystem_until(&mut app, |app| {
+            app.editor().document().external_state() == ExternalState::Modified
+        });
+
+        assert_eq!(app.editor().document().as_bytes(), b"local original");
+        assert!(app.editor().document().has_unsaved_changes());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn preserves_open_buffers_deleted_on_disk() {
+        let path = std::env::temp_dir().join(format!(
+            "bed-watch-delete-{}-{}.txt",
+            std::process::id(),
+            NEXT_TEST_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, b"only copy").unwrap();
+        let mut app = App::new(Editor::open(path.clone()).unwrap());
+        app.poll_filesystem().unwrap();
+
+        std::fs::remove_file(&path).unwrap();
+        poll_filesystem_until(&mut app, |app| {
+            app.editor().document().external_state() == ExternalState::Deleted
+        });
+
+        assert_eq!(app.editor().document().as_bytes(), b"only copy");
+        assert!(app.editor().document().has_unsaved_changes());
+        execute(&mut app, "q");
+        assert!(!app.should_quit());
+    }
+
+    #[test]
+    fn refreshes_file_tree_entries_after_create_and_delete() {
+        let root = std::env::temp_dir().join(format!(
+            "bed-watch-tree-{}-{}",
+            std::process::id(),
+            NEXT_TEST_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let mut app = App::for_directory(Editor::new(Document::scratch()), root.clone());
+        poll_filesystem_until(&mut app, |app| app.file_tree.entries().len() == 1);
+        let created = root.join("created.txt");
+
+        std::fs::write(&created, b"created").unwrap();
+        poll_filesystem_until(&mut app, |app| {
+            app.file_tree
+                .entries()
+                .iter()
+                .any(|entry| entry.path == created)
+        });
+
+        std::fs::remove_file(&created).unwrap();
+        poll_filesystem_until(&mut app, |app| {
+            !app.file_tree
+                .entries()
+                .iter()
+                .any(|entry| entry.path == created)
+        });
+        std::fs::remove_dir(root).unwrap();
     }
 
     #[test]

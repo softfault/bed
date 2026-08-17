@@ -301,6 +301,14 @@ fn terminal_input_redraws_after_child_output_instead_of_before_it() -> io::Resul
     )?;
     terminal.wait_for_output(b"INPUT_READY")?;
 
+    // The file tree is loaded in the background. Drain any initial tree frame
+    // before isolating the terminal-input redraw ordering below.
+    for _ in 0..20 {
+        if terminal.collect_for(Duration::from_millis(25))?.is_empty() {
+            break;
+        }
+    }
+
     terminal.write_input(b"x")?;
     let premature = terminal.collect_for(Duration::from_millis(75))?;
     assert!(

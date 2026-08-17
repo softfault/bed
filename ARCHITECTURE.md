@@ -37,7 +37,8 @@ Backends are selected at compile time. There is no dynamic backend trait or plat
 
 The application claims host input through `Terminal::events` and receives
 bounded batches of key, zero-based mouse, and sized-resize events. Timeout
-batches provide a portable wakeup for polling child sessions when no key is pressed. Synchronous
+batches provide a portable wakeup for polling child sessions and filesystem
+work when no key is pressed. Synchronous
 `read_key` remains for narrow terminal tests, but cannot be used after input
 has been claimed by the event thread.
 
@@ -69,7 +70,24 @@ mutation and undo/redo transition invalidates that cache.
 
 Windows refer to core `ViewId` values and retain one view and viewport per buffer they have shown. Cloning a tab duplicates those views and the complete split tree, preserving cursor, viewport, split-size, and focus state while continuing to refer to the same global buffers. Creating a new tab instead produces a single-window layout. Consequently, edits and undo/redo remain shared, while navigation state remains independent across windows and tabs. Only the active tab's layout is rendered.
 
-The file tree is also owned by `bed-tui`. Its root, expanded paths, selection, and scroll offset are tab-local, while width is a session-wide UI preference. It reads directories through `std::fs`, stores exact `PathBuf` values for navigation, and converts only display labels lossily when necessary. Directories are traversed only after explicit expansion, and directory symbolic links are not recursively followed. The tree opens files through the same buffer/view path as `:edit`; it is not an editor buffer and does not affect undo history.
+The file tree is also owned by `bed-tui`. Its root, expanded paths, selection,
+per-directory snapshots, and scroll offset are tab-local, while width is a
+session-wide UI preference. `notify` watches the active root and visible
+expanded directories non-recursively. Events only invalidate affected cache
+entries; a bounded worker reads and sorts those directories away from the UI
+thread, and stale scan results are rejected by revision numbers. Directory
+symbolic links are not recursively followed. The tree opens files through the
+same buffer/view path as `:edit`; it is not an editor buffer and does not affect
+undo history.
+
+The same watcher observes parent directories for every open file, including
+buffers that are not currently visible. This catches tools that save by
+renaming a temporary file over the original. Notifications are treated as
+hints: `Document` reads the current disk bytes and compares them with the live
+buffer and its last successful save. Clean buffers reload, dirty buffers retain
+their local content and enter a persistent conflict state, and deleted files
+remain recoverable in memory. The callback writes to a bounded queue; overflow
+causes a complete buffer reconciliation and invalidates the active tree cache.
 
 ## Terminal backends
 
@@ -146,11 +164,12 @@ Unsupported targets fail at compile time instead of silently using an ABI from a
 
 ## Dependencies
 
-The workspace has four external dependencies, all in platform-independent domains outside bed's terminal-backend focus:
+The workspace has five external dependencies outside bed's terminal-backend focus:
 
 - `anyhow` supplies error context.
+- `notify` provides native cross-platform filesystem change notifications.
 - `regex` provides bounded byte-oriented regular expressions for search and substitution.
 - `unicode-segmentation` implements Unicode grapheme boundaries.
 - `unicode-width` implements terminal display width.
 
-There is no platform abstraction dependency. Terminal ABI declarations, mode handling, input translation, and restoration remain part of bed's own terminal layer.
+There is no terminal platform abstraction dependency. Terminal ABI declarations, mode handling, input translation, and restoration remain part of bed's own terminal layer; filesystem notification portability is deliberately delegated to `notify`.

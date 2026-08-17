@@ -15,7 +15,7 @@ mod view;
 
 pub use buffer::{Buffer, BufferId, BufferStore};
 pub use cursor::Cursor;
-pub use document::Document;
+pub use document::{DiskReconcile, Document, ExternalState};
 pub use editor::{Editor, LineShift, SubstituteOptions, SubstituteRange, SubstituteResult};
 pub use pattern::RegexPattern;
 pub use view::{EditorView, SelectionKind, ViewId};

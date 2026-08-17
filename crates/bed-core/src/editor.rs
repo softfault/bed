@@ -6,8 +6,8 @@
 //! belongs to the active view.
 
 use crate::{
-    Buffer, BufferId, BufferStore, Cursor, Document, EditorView, RegexPattern, SelectionKind,
-    ViewId,
+    Buffer, BufferId, BufferStore, Cursor, DiskReconcile, Document, EditorView, RegexPattern,
+    SelectionKind, ViewId,
 };
 use anyhow::{Context, Result};
 use std::{
@@ -835,6 +835,27 @@ impl Editor {
         self.save_all_impl(true)
     }
 
+    pub fn reconcile_buffer_disk(&mut self, buffer_id: BufferId) -> Result<DiskReconcile> {
+        let buffer = self
+            .buffers
+            .get_mut(buffer_id)
+            .context("buffer disappeared while reconciling its file")?;
+        let result = buffer.document_mut().reconcile_disk()?;
+        let document_len = buffer.document().len();
+
+        if result != DiskReconcile::Unchanged {
+            if self.view.buffer_id == buffer_id {
+                normalize_view_bounds(&mut self.view, document_len);
+            }
+            for view in self.parked_views.values_mut() {
+                if view.buffer_id == buffer_id {
+                    normalize_view_bounds(view, document_len);
+                }
+            }
+        }
+        Ok(result)
+    }
+
     fn save_all_impl(&mut self, force: bool) -> Result<usize> {
         let mut written = 0;
         for &buffer_id in &self.buffer_order {
@@ -842,7 +863,7 @@ impl Editor {
                 .buffers
                 .get_mut(buffer_id)
                 .expect("buffer order references a missing buffer");
-            if buffer.document().is_dirty() {
+            if buffer.document().has_unsaved_changes() {
                 if force {
                     buffer.document_mut().save_force()?;
                 } else {
@@ -893,7 +914,7 @@ impl Editor {
         self.buffer_order.iter().any(|&buffer_id| {
             self.buffers
                 .get(buffer_id)
-                .is_some_and(|buffer| buffer.document().is_dirty())
+                .is_some_and(|buffer| buffer.document().has_unsaved_changes())
         })
     }
 
@@ -903,7 +924,7 @@ impl Editor {
             .filter(|&&buffer_id| {
                 self.buffers
                     .get(buffer_id)
-                    .is_some_and(|buffer| buffer.document().is_dirty())
+                    .is_some_and(|buffer| buffer.document().has_unsaved_changes())
             })
             .count()
     }

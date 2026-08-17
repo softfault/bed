@@ -27,6 +27,12 @@ Linux x86_64 and Windows x86_64 are runtime-tested. Linux aarch64, macOS x86_64/
 
 Each file path opens in its own buffer. If a path does not exist, `bed` starts that buffer empty and creates the file on `:w`. Starting without a path opens the current directory in the file tree; passing a directory opens that directory directly.
 
+bed watches the parent directory of every open file. A clean buffer reloads
+automatically when another program changes it. Local edits are preserved when
+the disk also changes, with `[conflict]` shown until `:w!` explicitly resolves
+the conflict. A file removed from disk remains open as `[deleted]` so its last
+content cannot be discarded by a normal quit.
+
 ## Keys
 
 Normal mode:
@@ -161,13 +167,15 @@ The tab line is always present above the editor area. Only the active tab is hig
 
 ## File tree
 
-On terminals at least 40 columns wide, bed keeps a file tree at the left edge. Its initial root is the first startup directory, or the directory containing the first startup file, and the header shows that directory's name. Each tab retains its own root, expanded directories, selection, and scroll position; the panel width is a global UI preference shared by all tabs. The panel uses only the standard library filesystem API and keeps exact platform-native paths internally.
+On terminals at least 40 columns wide, bed keeps a file tree at the left edge. Its initial root is the first startup directory, or the directory containing the first startup file, and the header shows that directory's name. Each tab retains its own root, expanded directories, selection, and scroll position; the panel width is a global UI preference shared by all tabs. Native filesystem notifications keep the active tree synchronized with changes from terminals, scripts, and other tools. The root and visible expanded directories are cached separately and scanned on a bounded background worker, so large directories do not block the UI thread.
 
 - `Ctrl-N`: enter or leave the file tree
 - `Ctrl-W l` or `Ctrl-W w`: return to the previously active editor window
 - `j` / `k` or arrows: move the selection
 - `Enter` or `l`: enter `..`, expand a directory, or open a file in the active window
 - `h`: enter `..`, collapse a directory, or select its parent
+- `H`: make the current root's parent the new root
+- `L`: make the selected directory the new root
 - `[count] Ctrl-W <` / `>`: decrease/increase the file tree width
 - `[count] Ctrl-W |`: set its width exactly; without a count, maximize it
 - `Ctrl-W =`: restore the default file tree width
@@ -178,4 +186,4 @@ On terminals at least 40 columns wide, bed keeps a file tree at the left edge. I
 - `:treewidth N`: set the file tree width to at least 10 columns
 - `:treerefresh`: refresh without changing focus
 
-The sidebar is hidden automatically on narrower terminals so the editing area remains usable.
+The sidebar is hidden automatically on narrower terminals so the editing area remains usable. `r` and `:treerefresh` invalidate the visible directory cache and recover from missed or overflowed native events.

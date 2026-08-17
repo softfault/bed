@@ -35,6 +35,7 @@ fn main() -> Result<()> {
                 }
             }
         }
+        redraw |= app.poll_filesystem()?;
         redraw |= app.poll_terminals()?;
     }
     Ok(())

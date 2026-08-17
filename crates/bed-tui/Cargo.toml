@@ -16,5 +16,9 @@ bed-core.workspace = true
 bed-terminal.workspace = true
 bed-terminal-session.workspace = true
 bed-vt100.workspace = true
+notify.workspace = true
 unicode-segmentation.workspace = true
 unicode-width.workspace = true
+
+[dev-dependencies]
+bed-file.workspace = true

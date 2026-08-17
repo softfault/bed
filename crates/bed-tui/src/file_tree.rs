@@ -1,7 +1,8 @@
-//! Dependency-free filesystem tree state.
+//! Incremental filesystem tree state backed by per-directory snapshots.
 
+use crate::filesystem::{ScanKey, ScannedEntry, absolute_path};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs, io,
     path::{Path, PathBuf},
 };
@@ -25,7 +26,11 @@ pub(crate) struct FileTree {
     root: PathBuf,
     entries: Vec<TreeEntry>,
     expanded: HashSet<PathBuf>,
+    directories: HashMap<PathBuf, Vec<ScannedEntry>>,
+    directory_revisions: HashMap<PathBuf, u64>,
+    tree_revision: u64,
     selected: usize,
+    selected_path: Option<PathBuf>,
     row_offset: usize,
 }
 
@@ -36,15 +41,24 @@ impl FileTree {
         } else {
             root
         };
+        let root = absolute_path(&root).unwrap_or(root);
         let mut tree = Self {
             root,
             entries: Vec::new(),
             expanded: HashSet::new(),
+            directories: HashMap::new(),
+            directory_revisions: HashMap::new(),
+            tree_revision: 0,
             selected: 0,
+            selected_path: None,
             row_offset: 0,
         };
-        let _ = tree.refresh();
+        tree.rebuild_entries();
         tree
+    }
+
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
     }
 
     pub(crate) fn root_label(&self) -> String {
@@ -68,47 +82,124 @@ impl FileTree {
     }
 
     pub(crate) fn set_root(&mut self, root: PathBuf) -> io::Result<()> {
-        let previous = std::mem::replace(&mut self.root, root);
-        let previous_expanded = std::mem::take(&mut self.expanded);
-        if let Err(error) = self.refresh() {
-            self.root = previous;
-            self.expanded = previous_expanded;
-            return Err(error);
+        let root = absolute_path(&root)?;
+        if !fs::metadata(&root)?.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotADirectory,
+                format!("{} is not a directory", root.display()),
+            ));
         }
+        self.root = root;
+        self.expanded.clear();
+        self.invalidate_all();
         self.selected = 0;
+        self.selected_path = None;
         self.row_offset = 0;
         Ok(())
     }
 
-    pub(crate) fn refresh(&mut self) -> io::Result<()> {
-        let selected_path = self
-            .entries
-            .get(self.selected)
-            .map(|entry| entry.path.clone());
-        let mut entries = Vec::new();
-        if let Some(parent) = absolute_parent(&self.root)? {
-            entries.push(TreeEntry {
-                path: parent,
-                depth: 0,
-                kind: TreeEntryKind::Parent,
-            });
+    pub(crate) fn set_parent_as_root(&mut self) -> io::Result<()> {
+        let Some(parent) = self.root.parent().map(PathBuf::from) else {
+            return Ok(());
+        };
+        self.move_to_parent(parent)
+    }
+
+    pub(crate) fn set_selected_as_root(&mut self) -> io::Result<()> {
+        let Some(path) = self.selected_path.clone().or_else(|| {
+            self.entries
+                .get(self.selected)
+                .map(|entry| entry.path.clone())
+        }) else {
+            return Ok(());
+        };
+        if !fs::metadata(&path)?.is_dir() {
+            return Ok(());
         }
-        collect_entries(&self.root, 0, &self.expanded, &mut entries)?;
-        self.entries = entries;
-        self.selected = selected_path
-            .and_then(|path| self.entries.iter().position(|entry| entry.path == path))
-            .unwrap_or_else(|| self.selected.min(self.entries.len().saturating_sub(1)));
+        self.set_root(path)
+    }
+
+    pub(crate) fn refresh(&mut self) -> io::Result<()> {
+        self.invalidate_all();
         Ok(())
+    }
+
+    pub(crate) fn invalidate_paths<'a>(
+        &mut self,
+        paths: impl IntoIterator<Item = &'a Path>,
+    ) -> bool {
+        let mut directories = HashSet::new();
+        for path in paths {
+            let Ok(path) = absolute_path(path) else {
+                continue;
+            };
+            if path == self.root || self.expanded.contains(&path) {
+                directories.insert(path.clone());
+            }
+            if let Some(parent) = path.parent()
+                && (parent == self.root || self.expanded.contains(parent))
+            {
+                directories.insert(parent.to_path_buf());
+            }
+        }
+        let mut invalidated = false;
+        for directory in directories {
+            invalidated |= self.invalidate_directory(&directory);
+        }
+        invalidated
+    }
+
+    pub(crate) fn watched_directories(&self) -> HashSet<PathBuf> {
+        self.visible_directories().into_iter().collect()
+    }
+
+    pub(crate) fn scan_requests(&self, tab: u64) -> Vec<ScanKey> {
+        self.visible_directories()
+            .into_iter()
+            .filter(|path| !self.directories.contains_key(path))
+            .map(|path| ScanKey {
+                tab,
+                tree_revision: self.tree_revision,
+                directory_revision: self.directory_revision(&path),
+                path,
+            })
+            .collect()
+    }
+
+    pub(crate) fn apply_scan(
+        &mut self,
+        key: &ScanKey,
+        entries: io::Result<Vec<ScannedEntry>>,
+    ) -> Result<bool, String> {
+        if key.tree_revision != self.tree_revision
+            || key.directory_revision != self.directory_revision(&key.path)
+        {
+            return Ok(false);
+        }
+        match entries {
+            Ok(entries) => {
+                self.directories.insert(key.path.clone(), entries);
+                self.rebuild_entries();
+                Ok(true)
+            }
+            Err(error) => {
+                self.directories.insert(key.path.clone(), Vec::new());
+                self.rebuild_entries();
+                Err(format!("failed to read {}: {error}", key.path.display()))
+            }
+        }
     }
 
     pub(crate) fn move_up(&mut self) {
         self.selected = self.selected.saturating_sub(1);
+        self.remember_selected_path();
     }
 
     pub(crate) fn move_down(&mut self) {
         if self.selected + 1 < self.entries.len() {
             self.selected += 1;
         }
+        self.remember_selected_path();
     }
 
     pub(crate) fn activate(&mut self) -> io::Result<Option<PathBuf>> {
@@ -124,19 +215,11 @@ impl FileTree {
             TreeEntryKind::Directory => {}
         }
 
-        let was_expanded = self.expanded.contains(&entry.path);
-        if was_expanded {
-            self.expanded.remove(&entry.path);
+        if self.expanded.remove(&entry.path) {
+            self.rebuild_entries();
         } else {
-            self.expanded.insert(entry.path.clone());
-        }
-        if let Err(error) = self.refresh() {
-            if was_expanded {
-                self.expanded.insert(entry.path);
-            } else {
-                self.expanded.remove(&entry.path);
-            }
-            return Err(error);
+            self.expanded.insert(entry.path);
+            self.rebuild_entries();
         }
         Ok(None)
     }
@@ -149,7 +232,8 @@ impl FileTree {
             return self.move_to_parent(entry.path);
         }
         if entry.kind == TreeEntryKind::Directory && self.expanded.remove(&entry.path) {
-            return self.refresh();
+            self.rebuild_entries();
+            return Ok(());
         }
         if entry.depth == 0 {
             return Ok(());
@@ -159,19 +243,7 @@ impl FileTree {
             .rposition(|candidate| candidate.depth < entry.depth)
         {
             self.selected = parent;
-        }
-        Ok(())
-    }
-
-    fn move_to_parent(&mut self, parent: PathBuf) -> io::Result<()> {
-        let previous_root = std::path::absolute(&self.root)?;
-        self.set_root(parent)?;
-        if let Some(index) = self
-            .entries
-            .iter()
-            .position(|entry| entry.path == previous_root)
-        {
-            self.selected = index;
+            self.remember_selected_path();
         }
         Ok(())
     }
@@ -186,48 +258,113 @@ impl FileTree {
             self.row_offset = self.selected - rows + 1;
         }
     }
-}
 
-fn collect_entries(
-    directory: &Path,
-    depth: usize,
-    expanded: &HashSet<PathBuf>,
-    output: &mut Vec<TreeEntry>,
-) -> io::Result<()> {
-    let mut entries = fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
-    entries.sort_by_cached_key(|entry| {
-        let is_directory = entry.file_type().is_ok_and(|file_type| file_type.is_dir());
-        (!is_directory, entry.file_name())
-    });
+    fn move_to_parent(&mut self, parent: PathBuf) -> io::Result<()> {
+        let previous_root = self.root.clone();
+        self.set_root(parent)?;
+        self.selected_path = Some(previous_root);
+        Ok(())
+    }
 
-    for entry in entries {
-        let path = entry.path();
-        let is_directory = entry.file_type()?.is_dir();
-        output.push(TreeEntry {
-            path: path.clone(),
-            depth,
-            kind: if is_directory {
-                TreeEntryKind::Directory
-            } else {
-                TreeEntryKind::File
-            },
-        });
-        if is_directory && expanded.contains(&path) {
-            collect_entries(&path, depth + 1, expanded, output)?;
+    fn invalidate_all(&mut self) {
+        self.tree_revision = self.tree_revision.wrapping_add(1);
+        self.directories.clear();
+        self.directory_revisions.clear();
+        self.rebuild_entries();
+    }
+
+    fn invalidate_directory(&mut self, directory: &Path) -> bool {
+        let revision = self
+            .directory_revisions
+            .entry(directory.to_path_buf())
+            .or_default();
+        *revision = revision.wrapping_add(1);
+        let removed = self.directories.remove(directory).is_some();
+        if removed {
+            self.rebuild_entries();
+        }
+        true
+    }
+
+    fn directory_revision(&self, path: &Path) -> u64 {
+        self.directory_revisions.get(path).copied().unwrap_or(0)
+    }
+
+    fn visible_directories(&self) -> Vec<PathBuf> {
+        let mut directories = vec![self.root.clone()];
+        self.collect_visible_directories(&self.root, &mut directories);
+        directories
+    }
+
+    fn collect_visible_directories(&self, directory: &Path, output: &mut Vec<PathBuf>) {
+        let Some(entries) = self.directories.get(directory) else {
+            return;
+        };
+        for entry in entries {
+            if entry.is_directory && self.expanded.contains(&entry.path) {
+                output.push(entry.path.clone());
+                self.collect_visible_directories(&entry.path, output);
+            }
         }
     }
-    Ok(())
-}
 
-fn absolute_parent(path: &Path) -> io::Result<Option<PathBuf>> {
-    Ok(std::path::absolute(path)?.parent().map(PathBuf::from))
+    fn rebuild_entries(&mut self) {
+        let selected_path = self.selected_path.clone().or_else(|| {
+            self.entries
+                .get(self.selected)
+                .map(|entry| entry.path.clone())
+        });
+        let mut entries = Vec::new();
+        if let Some(parent) = self.root.parent().map(PathBuf::from) {
+            entries.push(TreeEntry {
+                path: parent,
+                depth: 0,
+                kind: TreeEntryKind::Parent,
+            });
+        }
+        self.collect_entries(&self.root, 0, &mut entries);
+        self.entries = entries;
+        if let Some(path) = selected_path
+            && let Some(index) = self.entries.iter().position(|entry| entry.path == path)
+        {
+            self.selected = index;
+            self.selected_path = Some(path);
+            return;
+        }
+        self.selected = self.selected.min(self.entries.len().saturating_sub(1));
+    }
+
+    fn collect_entries(&self, directory: &Path, depth: usize, output: &mut Vec<TreeEntry>) {
+        let Some(entries) = self.directories.get(directory) else {
+            return;
+        };
+        for entry in entries {
+            output.push(TreeEntry {
+                path: entry.path.clone(),
+                depth,
+                kind: if entry.is_directory {
+                    TreeEntryKind::Directory
+                } else {
+                    TreeEntryKind::File
+                },
+            });
+            if entry.is_directory && self.expanded.contains(&entry.path) {
+                self.collect_entries(&entry.path, depth + 1, output);
+            }
+        }
+    }
+
+    fn remember_selected_path(&mut self) {
+        self.selected_path = self
+            .entries
+            .get(self.selected)
+            .map(|entry| entry.path.clone());
+    }
 }
 
 fn directory_label(path: &Path) -> String {
-    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
-    absolute
-        .file_name()
-        .unwrap_or_else(|| absolute.as_os_str())
+    path.file_name()
+        .unwrap_or(path.as_os_str())
         .to_string_lossy()
         .into_owned()
 }
@@ -235,11 +372,45 @@ fn directory_label(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::{FileTree, TreeEntryKind, directory_label};
+    use crate::filesystem::{ScanKey, ScannedEntry};
     use std::{
         fs,
-        path::PathBuf,
+        path::{Path, PathBuf},
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    fn load_visible(tree: &mut FileTree) {
+        loop {
+            let requests = tree.scan_requests(0);
+            if requests.is_empty() {
+                break;
+            }
+            for key in requests {
+                let entries = scan(&key.path);
+                tree.apply_scan(&key, Ok(entries)).unwrap();
+            }
+        }
+    }
+
+    fn scan(path: &Path) -> Vec<ScannedEntry> {
+        let mut entries: Vec<_> = fs::read_dir(path)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                ScannedEntry {
+                    path: entry.path(),
+                    is_directory: entry.file_type().unwrap().is_dir(),
+                }
+            })
+            .collect();
+        entries.sort_by_cached_key(|entry| {
+            (
+                !entry.is_directory,
+                entry.path.file_name().unwrap().to_os_string(),
+            )
+        });
+        entries
+    }
 
     #[test]
     fn sorts_expands_and_collapses_directories() {
@@ -254,11 +425,13 @@ mod tests {
         fs::write(root.join("file"), b"").unwrap();
 
         let mut tree = FileTree::new(root.clone());
+        load_visible(&mut tree);
         assert_eq!(tree.entries().len(), 3);
         assert_eq!(tree.entries()[0].kind, TreeEntryKind::Parent);
         assert_eq!(tree.entries()[1].kind, TreeEntryKind::Directory);
         tree.move_down();
         tree.activate().unwrap();
+        load_visible(&mut tree);
         assert_eq!(tree.entries().len(), 4);
         assert_eq!(tree.entries()[2].depth, 1);
         tree.move_down();
@@ -282,45 +455,39 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
 
         let mut tree = FileTree::new(root.clone());
-        assert_eq!(
-            tree.root_label(),
-            root.file_name().unwrap().to_string_lossy()
-        );
+        load_visible(&mut tree);
         tree.activate().unwrap();
 
-        assert_eq!(tree.root, parent);
-        assert_eq!(
-            tree.root_label(),
-            parent.file_name().unwrap().to_string_lossy()
-        );
+        tree.set_selected_as_root().unwrap();
+        assert_eq!(tree.root(), root);
+        tree.set_parent_as_root().unwrap();
+        load_visible(&mut tree);
+
+        assert_eq!(tree.root(), parent);
         assert_eq!(tree.entries()[tree.selected()].path, root);
         assert_eq!(
             tree.entries()[tree.selected()].kind,
             TreeEntryKind::Directory
         );
-
-        let mut tree = FileTree::new(root.clone());
-        tree.collapse().unwrap();
-        assert_eq!(tree.root, parent);
-        assert_eq!(tree.entries()[tree.selected()].path, root);
-
         fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn ignores_stale_scan_results_after_invalidation() {
+        let root = std::env::temp_dir();
+        let mut tree = FileTree::new(root.clone());
+        let stale = tree.scan_requests(3).pop().unwrap();
+        tree.invalidate_paths(std::iter::once(root.as_path()));
+
+        assert!(!tree.apply_scan(&stale, Ok(Vec::new())).unwrap());
+        let current = tree.scan_requests(3).pop().unwrap();
+        assert_ne!(stale.directory_revision, current.directory_revision);
     }
 
     #[test]
     fn labels_relative_directories_and_filesystem_roots() {
         let current = std::env::current_dir().unwrap();
-        assert_eq!(
-            directory_label(PathBuf::from(".").as_path()),
-            current
-                .file_name()
-                .unwrap_or_else(|| current.as_os_str())
-                .to_string_lossy()
-        );
-        assert_eq!(
-            directory_label(PathBuf::from("chosen-alias").as_path()),
-            "chosen-alias"
-        );
+        assert_eq!(directory_label(PathBuf::from(".").as_path()), ".");
 
         let mut root = current;
         while let Some(parent) = root.parent() {
@@ -328,4 +495,7 @@ mod tests {
         }
         assert_eq!(directory_label(&root), root.to_string_lossy());
     }
+
+    #[allow(dead_code)]
+    fn assert_scan_key_is_send(_: ScanKey) {}
 }

@@ -13,6 +13,23 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ExternalState {
+    #[default]
+    InSync,
+    Modified,
+    Deleted,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiskReconcile {
+    Unchanged,
+    Reloaded,
+    Reconciled,
+    Conflict,
+    Deleted,
+}
+
 #[derive(Debug)]
 pub struct Document {
     path: PathBuf,
@@ -20,6 +37,7 @@ pub struct Document {
     bytes: Vec<u8>,
     saved_bytes: Vec<u8>,
     saved_file_state: SavedFileState,
+    external_state: ExternalState,
     line_ending: LineEnding,
     line_starts: OnceCell<Vec<usize>>,
 }
@@ -47,6 +65,7 @@ impl Document {
             bytes,
             saved_bytes,
             saved_file_state: SavedFileState::Untracked,
+            external_state: ExternalState::InSync,
             line_ending,
             line_starts: OnceCell::new(),
         }
@@ -143,7 +162,81 @@ impl Document {
         .with_context(|| format!("failed to write {}", self.path.display()))?;
         self.saved_bytes.clone_from(&self.bytes);
         self.saved_file_state = SavedFileState::Present;
+        self.external_state = ExternalState::InSync;
         Ok(())
+    }
+
+    pub fn reconcile_disk(&mut self) -> Result<DiskReconcile> {
+        if !self.file_backed {
+            return Ok(DiskReconcile::Unchanged);
+        }
+
+        let disk_bytes = match fs::read(&self.path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                if self.saved_file_state != SavedFileState::Present
+                    && self.external_state == ExternalState::InSync
+                {
+                    return Ok(DiskReconcile::Unchanged);
+                }
+                let changed = self.external_state != ExternalState::Deleted;
+                self.external_state = ExternalState::Deleted;
+                return Ok(if changed {
+                    DiskReconcile::Deleted
+                } else {
+                    DiskReconcile::Unchanged
+                });
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to read {}", self.path.display()));
+            }
+        };
+
+        if disk_bytes == self.bytes {
+            let changed = self.saved_bytes != disk_bytes
+                || self.saved_file_state != SavedFileState::Present
+                || self.external_state != ExternalState::InSync;
+            self.saved_bytes = disk_bytes;
+            self.saved_file_state = SavedFileState::Present;
+            self.external_state = ExternalState::InSync;
+            return Ok(if changed {
+                DiskReconcile::Reconciled
+            } else {
+                DiskReconcile::Unchanged
+            });
+        }
+
+        if !self.is_dirty() && self.external_state != ExternalState::Modified {
+            self.bytes = disk_bytes.clone();
+            self.saved_bytes = disk_bytes;
+            self.saved_file_state = SavedFileState::Present;
+            self.external_state = ExternalState::InSync;
+            self.line_ending = detect_line_ending(&self.bytes);
+            self.invalidate_line_starts();
+            return Ok(DiskReconcile::Reloaded);
+        }
+
+        if disk_bytes == self.saved_bytes && self.external_state != ExternalState::Modified {
+            let changed = self.external_state != ExternalState::InSync
+                || self.saved_file_state != SavedFileState::Present;
+            self.saved_file_state = SavedFileState::Present;
+            self.external_state = ExternalState::InSync;
+            return Ok(if changed {
+                DiskReconcile::Reconciled
+            } else {
+                DiskReconcile::Unchanged
+            });
+        }
+
+        let changed = self.external_state != ExternalState::Modified;
+        self.saved_file_state = SavedFileState::Present;
+        self.external_state = ExternalState::Modified;
+        Ok(if changed {
+            DiskReconcile::Conflict
+        } else {
+            DiskReconcile::Unchanged
+        })
     }
 
     pub fn as_bytes(&self) -> &[u8] {
@@ -168,6 +261,14 @@ impl Document {
 
     pub fn is_dirty(&self) -> bool {
         self.bytes != self.saved_bytes
+    }
+
+    pub fn external_state(&self) -> ExternalState {
+        self.external_state
+    }
+
+    pub fn has_unsaved_changes(&self) -> bool {
+        self.is_dirty() || self.external_state != ExternalState::InSync
     }
 
     pub fn line_count(&self) -> usize {
@@ -275,7 +376,7 @@ fn detect_line_ending(bytes: &[u8]) -> LineEnding {
 
 #[cfg(test)]
 mod tests {
-    use super::Document;
+    use super::{DiskReconcile, Document, ExternalState};
     use std::{
         fs,
         path::PathBuf,
@@ -398,6 +499,67 @@ mod tests {
 
         assert!(document.is_empty());
         assert!(!document.is_dirty());
+    }
+
+    #[test]
+    fn reloads_clean_documents_changed_on_disk() {
+        let temp_file = TempFile::new();
+        fs::write(&temp_file.0, b"original").unwrap();
+        let mut document = Document::open(temp_file.path()).unwrap();
+        fs::write(&temp_file.0, b"external\r\nchange").unwrap();
+
+        assert_eq!(document.reconcile_disk().unwrap(), DiskReconcile::Reloaded);
+        assert_eq!(document.as_bytes(), b"external\r\nchange");
+        assert_eq!(document.line_ending(), b"\r\n");
+        assert_eq!(document.external_state(), ExternalState::InSync);
+        assert!(!document.has_unsaved_changes());
+    }
+
+    #[test]
+    fn preserves_dirty_documents_and_marks_external_conflicts() {
+        let temp_file = TempFile::new();
+        fs::write(&temp_file.0, b"original").unwrap();
+        let mut document = Document::open(temp_file.path()).unwrap();
+        document.insert_bytes(document.len(), b" local").unwrap();
+        fs::write(&temp_file.0, b"external").unwrap();
+
+        assert_eq!(document.reconcile_disk().unwrap(), DiskReconcile::Conflict);
+        assert_eq!(document.as_bytes(), b"original local");
+        assert_eq!(document.external_state(), ExternalState::Modified);
+        assert!(document.has_unsaved_changes());
+        assert_eq!(document.reconcile_disk().unwrap(), DiskReconcile::Unchanged);
+
+        document.save_force().unwrap();
+        assert_eq!(document.external_state(), ExternalState::InSync);
+    }
+
+    #[test]
+    fn preserves_documents_deleted_on_disk() {
+        let temp_file = TempFile::new();
+        fs::write(&temp_file.0, b"only copy").unwrap();
+        let mut document = Document::open(temp_file.path()).unwrap();
+        fs::remove_file(&temp_file.0).unwrap();
+
+        assert_eq!(document.reconcile_disk().unwrap(), DiskReconcile::Deleted);
+        assert_eq!(document.as_bytes(), b"only copy");
+        assert_eq!(document.external_state(), ExternalState::Deleted);
+        assert!(document.has_unsaved_changes());
+    }
+
+    #[test]
+    fn silently_reconciles_when_disk_matches_local_content() {
+        let temp_file = TempFile::new();
+        fs::write(&temp_file.0, b"original").unwrap();
+        let mut document = Document::open(temp_file.path()).unwrap();
+        document.insert_bytes(document.len(), b" local").unwrap();
+        fs::write(&temp_file.0, b"original local").unwrap();
+
+        assert_eq!(
+            document.reconcile_disk().unwrap(),
+            DiskReconcile::Reconciled
+        );
+        assert!(!document.has_unsaved_changes());
+        assert_eq!(document.external_state(), ExternalState::InSync);
     }
 
     #[test]
