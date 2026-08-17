@@ -2063,13 +2063,19 @@ impl App {
                 }
             }
             Key::Char('l') | Key::ArrowRight | Key::Enter => match self.file_tree.activate() {
-                Ok(Some(path)) => match self.editor.open_buffer(path) {
-                    Ok(buffer_id) => {
-                        self.show_buffer(buffer_id);
-                        self.mode = Mode::Normal;
+                Ok(Some(path)) => {
+                    self.focus_tree_open_window();
+                    match self.editor.open_buffer(path) {
+                        Ok(buffer_id) => {
+                            self.show_buffer(buffer_id);
+                            self.mode = Mode::Normal;
+                        }
+                        Err(error) => {
+                            self.mode = Mode::Tree;
+                            self.message.push_str(&format!("Open failed: {error:#}"));
+                        }
                     }
-                    Err(error) => self.message.push_str(&format!("Open failed: {error:#}")),
-                },
+                }
                 Ok(None) => {}
                 Err(error) => self.message.push_str(&format!("Tree failed: {error}")),
             },
@@ -3278,6 +3284,43 @@ impl App {
             WindowContent::Text => Mode::Normal,
             WindowContent::Terminal(_) => Mode::TerminalNormal,
         };
+    }
+
+    fn focus_tree_open_window(&mut self) {
+        if self.active_window().content == WindowContent::Text {
+            return;
+        }
+        let text_window = self
+            .active_window_history
+            .iter()
+            .rev()
+            .copied()
+            .chain(self.layout.windows())
+            .find(|window_id| {
+                self.windows
+                    .get(window_id)
+                    .is_some_and(|window| window.content == WindowContent::Text)
+            });
+        if let Some(window_id) = text_window {
+            self.activate_window(window_id);
+            return;
+        }
+
+        let buffer_id = self.editor.buffer_id();
+        let source = self.active_window().view_id;
+        let viewport = self.viewport().clone();
+        let view_id = self
+            .editor
+            .duplicate_view(source)
+            .expect("active window references a missing editor view");
+        let window_id = self.allocate_window_id();
+        let inserted = self
+            .layout
+            .split(self.active_window, window_id, SplitAxis::Rows);
+        debug_assert!(inserted);
+        self.windows
+            .insert(window_id, Window::new(buffer_id, view_id, viewport));
+        self.activate_window(window_id);
     }
 
     fn show_buffer(&mut self, buffer_id: BufferId) {
@@ -6405,6 +6448,68 @@ mod tests {
             root.join("directory").join("nested.txt")
         );
         assert_eq!(app.editor().document().as_bytes(), b"nested");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_tree_opens_files_in_the_recent_text_window_from_a_terminal() {
+        let root = std::env::temp_dir().join(format!(
+            "bed-tree-terminal-{}-{}",
+            std::process::id(),
+            NEXT_TEST_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let mut app = App::for_directory(Editor::new(Document::scratch()), root.clone());
+        app.render(TerminalSize {
+            rows: 12,
+            columns: 80,
+        });
+        poll_filesystem_until(&mut app, |app| app.file_tree.entries().len() == 1);
+
+        execute(&mut app, "terminal sleep 30");
+        let terminal_window = app.active_window;
+        let terminal_session = app.active_terminal_session_id().unwrap();
+        let terminal_text_view = app.windows[&terminal_window].view_id;
+        let terminal_buffer = app
+            .editor()
+            .view_by_id(terminal_text_view)
+            .unwrap()
+            .buffer_id();
+        app.handle_key(Key::Ctrl('\\')).unwrap();
+        app.handle_key(Key::Ctrl('n')).unwrap();
+        assert_eq!(app.mode(), Mode::TerminalNormal);
+
+        let path = root.join("created.txt");
+        std::fs::write(&path, b"created").unwrap();
+        poll_filesystem_until(&mut app, |app| {
+            app.file_tree
+                .entries()
+                .iter()
+                .any(|entry| entry.path == path)
+        });
+        app.handle_key(Key::Ctrl('w')).unwrap();
+        app.handle_key(Key::Char('h')).unwrap();
+        assert_eq!(app.mode(), Mode::Tree);
+        app.handle_key(Key::Char('j')).unwrap();
+        app.handle_key(Key::Char('l')).unwrap();
+
+        assert_eq!(app.mode(), Mode::Normal);
+        assert_ne!(app.active_window, terminal_window);
+        assert_eq!(app.active_window().content, WindowContent::Text);
+        assert_eq!(app.editor().document().path(), path.as_path());
+        assert!(matches!(
+            app.windows[&terminal_window].content,
+            WindowContent::Terminal(_)
+        ));
+        assert_eq!(
+            app.editor()
+                .view_by_id(terminal_text_view)
+                .unwrap()
+                .buffer_id(),
+            terminal_buffer
+        );
+        app.terminals.close(terminal_session, true).unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
 
