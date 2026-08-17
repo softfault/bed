@@ -4,6 +4,8 @@ All notable changes to bed are documented in this file.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-08-17
+
 ### Added
 
 - Run external commands in retained, non-blocking terminal splits through
@@ -93,7 +95,8 @@ There are no functional changes from the beta release.
 - Native terminal backends for Linux, Windows, macOS, FreeBSD, and NetBSD.
 - Native runtime coverage on Linux x86_64 and Windows x86_64, with cross-target checks for the other supported targets.
 
-[Unreleased]: https://github.com/softfault/bed/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/softfault/bed/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/softfault/bed/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/softfault/bed/compare/v0.4.0-beta.1...v0.4.0
 [0.4.0-beta.1]: https://github.com/softfault/bed/compare/v0.3.0...v0.4.0-beta.1
 [0.3.0]: https://github.com/softfault/bed/compare/v0.2.1...v0.3.0
