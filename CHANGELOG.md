@@ -19,6 +19,8 @@ All notable changes to bed are documented in this file.
 
 - Load the tree root and visible expanded directories on a bounded background
   worker instead of recursively scanning them on the UI thread.
+- Keep the previous directory snapshot visible while rescanning, and skip
+  redraws when the replacement snapshot has not changed.
 - Develop and test bed with the latest stable Rust toolchain. The workspace
   minimum is Rust 1.88, required by `notify 9.0.0-rc.4`.
 

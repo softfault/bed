@@ -249,15 +249,19 @@ struct TempPath(PathBuf);
 impl TempPath {
     fn new() -> Self {
         let id = NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed);
-        Self(
-            std::env::temp_dir().join(format!("bed-terminal-test-{}-{id}.txt", std::process::id())),
-        )
+        let directory =
+            std::env::temp_dir().join(format!("bed-terminal-test-{}-{id}", std::process::id()));
+        fs::create_dir(&directory).unwrap();
+        Self(directory.join("test.txt"))
     }
 }
 
 impl Drop for TempPath {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.0);
+        if let Some(parent) = self.0.parent() {
+            let _ = fs::remove_dir(parent);
+        }
     }
 }
 

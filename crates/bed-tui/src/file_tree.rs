@@ -27,6 +27,7 @@ pub(crate) struct FileTree {
     entries: Vec<TreeEntry>,
     expanded: HashSet<PathBuf>,
     directories: HashMap<PathBuf, Vec<ScannedEntry>>,
+    stale_directories: HashSet<PathBuf>,
     directory_revisions: HashMap<PathBuf, u64>,
     tree_revision: u64,
     selected: usize,
@@ -47,6 +48,7 @@ impl FileTree {
             entries: Vec::new(),
             expanded: HashSet::new(),
             directories: HashMap::new(),
+            stale_directories: HashSet::new(),
             directory_revisions: HashMap::new(),
             tree_revision: 0,
             selected: 0,
@@ -91,7 +93,7 @@ impl FileTree {
         }
         self.root = root;
         self.expanded.clear();
-        self.invalidate_all();
+        self.reset();
         self.selected = 0;
         self.selected_path = None;
         self.row_offset = 0;
@@ -120,14 +122,13 @@ impl FileTree {
     }
 
     pub(crate) fn refresh(&mut self) -> io::Result<()> {
-        self.invalidate_all();
+        for directory in self.visible_directories() {
+            self.invalidate_directory(&directory);
+        }
         Ok(())
     }
 
-    pub(crate) fn invalidate_paths<'a>(
-        &mut self,
-        paths: impl IntoIterator<Item = &'a Path>,
-    ) -> bool {
+    pub(crate) fn invalidate_paths<'a>(&mut self, paths: impl IntoIterator<Item = &'a Path>) {
         let mut directories = HashSet::new();
         for path in paths {
             let Ok(path) = absolute_path(path) else {
@@ -142,11 +143,9 @@ impl FileTree {
                 directories.insert(parent.to_path_buf());
             }
         }
-        let mut invalidated = false;
         for directory in directories {
-            invalidated |= self.invalidate_directory(&directory);
+            self.invalidate_directory(&directory);
         }
-        invalidated
     }
 
     pub(crate) fn watched_directories(&self) -> HashSet<PathBuf> {
@@ -156,7 +155,9 @@ impl FileTree {
     pub(crate) fn scan_requests(&self, tab: u64) -> Vec<ScanKey> {
         self.visible_directories()
             .into_iter()
-            .filter(|path| !self.directories.contains_key(path))
+            .filter(|path| {
+                !self.directories.contains_key(path) || self.stale_directories.contains(path)
+            })
             .map(|path| ScanKey {
                 tab,
                 tree_revision: self.tree_revision,
@@ -178,13 +179,27 @@ impl FileTree {
         }
         match entries {
             Ok(entries) => {
+                self.stale_directories.remove(&key.path);
+                let changed = self.directories.get(&key.path) != Some(&entries);
                 self.directories.insert(key.path.clone(), entries);
-                self.rebuild_entries();
-                Ok(true)
+                if changed {
+                    self.rebuild_entries();
+                }
+                Ok(changed)
             }
             Err(error) => {
-                self.directories.insert(key.path.clone(), Vec::new());
-                self.rebuild_entries();
+                self.stale_directories.remove(&key.path);
+                if error.kind() == io::ErrorKind::NotFound {
+                    let changed = self
+                        .directories
+                        .insert(key.path.clone(), Vec::new())
+                        .is_some_and(|entries| !entries.is_empty());
+                    if changed {
+                        self.rebuild_entries();
+                    }
+                } else {
+                    self.directories.entry(key.path.clone()).or_default();
+                }
                 Err(format!("failed to read {}: {error}", key.path.display()))
             }
         }
@@ -266,24 +281,21 @@ impl FileTree {
         Ok(())
     }
 
-    fn invalidate_all(&mut self) {
+    fn reset(&mut self) {
         self.tree_revision = self.tree_revision.wrapping_add(1);
         self.directories.clear();
+        self.stale_directories.clear();
         self.directory_revisions.clear();
         self.rebuild_entries();
     }
 
-    fn invalidate_directory(&mut self, directory: &Path) -> bool {
+    fn invalidate_directory(&mut self, directory: &Path) {
         let revision = self
             .directory_revisions
             .entry(directory.to_path_buf())
             .or_default();
         *revision = revision.wrapping_add(1);
-        let removed = self.directories.remove(directory).is_some();
-        if removed {
-            self.rebuild_entries();
-        }
-        true
+        self.stale_directories.insert(directory.to_path_buf());
     }
 
     fn directory_revision(&self, path: &Path) -> u64 {
@@ -482,6 +494,46 @@ mod tests {
         assert!(!tree.apply_scan(&stale, Ok(Vec::new())).unwrap());
         let current = tree.scan_requests(3).pop().unwrap();
         assert_ne!(stale.directory_revision, current.directory_revision);
+    }
+
+    #[test]
+    fn keeps_the_previous_snapshot_until_a_changed_scan_arrives() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("bed-tree-stable-{}-{nonce}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let original = root.join("original");
+        fs::write(&original, b"").unwrap();
+        let mut tree = FileTree::new(root.clone());
+        load_visible(&mut tree);
+        let previous: Vec<_> = tree
+            .entries()
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect();
+
+        tree.invalidate_paths(std::iter::once(original.as_path()));
+        assert_eq!(
+            tree.entries()
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect::<Vec<_>>(),
+            previous
+        );
+        let unchanged = tree.scan_requests(0).pop().unwrap();
+        assert!(!tree.apply_scan(&unchanged, Ok(scan(&root))).unwrap());
+
+        let created = root.join("created");
+        fs::write(&created, b"").unwrap();
+        tree.invalidate_paths(std::iter::once(created.as_path()));
+        let changed = tree.scan_requests(0).pop().unwrap();
+        assert!(tree.apply_scan(&changed, Ok(scan(&root))).unwrap());
+        assert!(tree.entries().iter().any(|entry| entry.path == created));
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

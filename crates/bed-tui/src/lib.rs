@@ -37,7 +37,8 @@ use unicode_width::UnicodeWidthStr;
 const TAB_STOP: usize = 4;
 
 // Full-frame rendering hides the cursor, clears the display, draws windows by
-// absolute position, then restores the cursor at its final position.
+// absolute position, then restores the cursor at its final position. The
+// terminal boundary wraps the complete byte stream in synchronized output.
 const BEGIN_FRAME: &[u8] = b"\x1b[?25l\x1b[H\x1b[2J";
 const BLOCK_CURSOR: &[u8] = b"\x1b[2 q";
 const BAR_CURSOR: &[u8] = b"\x1b[6 q";
@@ -935,10 +936,8 @@ impl App {
 
         if batch.overflowed {
             self.file_tree.refresh()?;
-            redraw = true;
         } else {
-            redraw |= self
-                .file_tree
+            self.file_tree
                 .invalidate_paths(batch.paths.iter().map(PathBuf::as_path));
         }
         redraw |= self.reconcile_changed_buffers(&batch.paths, batch.overflowed);
