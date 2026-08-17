@@ -109,7 +109,7 @@ channels. Its `poll` API keeps emulator mutation, generated-response routing,
 EOF finalization, process status, bell deltas, and UI-visible errors on the
 caller thread, including separate audible and visual bell deltas.
 
-The embedded terminal under development for 0.4.0 uses `bed-vt100`, an
+The embedded terminal introduced in 0.4.0 uses `bed-vt100`, an
 independently written terminal emulator maintained in this workspace.
 `:terminal [COMMAND]` now creates an independent session in a bottom split;
 the TUI renders child cells, attributes, cursor, status, and view-local

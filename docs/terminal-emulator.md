@@ -1,7 +1,7 @@
 # bed-vt100 terminal emulator
 
 This document defines the implementation boundary for the embedded terminal
-planned for bed 0.4.0. `bed-vt100` is a native bed component, not an
+introduced in bed 0.4.0. `bed-vt100` is a native bed component, not an
 API-compatible replacement for the `vt100` crate.
 
 ## Goals
