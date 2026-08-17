@@ -31,9 +31,19 @@ Terminal::size(&self) -> Result<TerminalSize>
 Terminal::read_key(&mut self) -> Result<Key>
 Terminal::events(&mut self) -> Result<TerminalEvents>
 Terminal::draw(&mut self, bytes: &[u8]) -> Result<()>
+Terminal::draw_frame(&mut self, bytes: &[u8], size: TerminalSize) -> Result<()>
 ```
 
 Backends are selected at compile time. There is no dynamic backend trait or platform state in the editor core.
+
+`draw` is the raw synchronized-output boundary used by narrow terminal
+operations and tests. The application uses `draw_frame`: `bed-terminal`
+parses bed's deliberately small host-rendering protocol into a retained,
+grapheme-aware cell grid, compares it with the previous frame, and emits only
+changed cell runs plus cursor state. The first frame and terminal resizes
+invalidate the retained grid and use the complete clear-and-paint frame. This
+keeps damage tracking independent from editor state while preserving complex
+emoji, wide cells, colors, and attributes.
 
 The application claims host input through `Terminal::events` and receives
 bounded batches of key, zero-based mouse, and sized-resize events. Timeout

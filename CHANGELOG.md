@@ -21,6 +21,8 @@ All notable changes to bed are documented in this file.
   worker instead of recursively scanning them on the UI thread.
 - Keep the previous directory snapshot visible while rescanning, and skip
   redraws when the replacement snapshot has not changed.
+- Retain a grapheme-aware host frame and update only changed terminal cells;
+  full-screen clearing is now limited to the first frame and terminal resizes.
 - Develop and test bed with the latest stable Rust toolchain. The workspace
   minimum is Rust 1.88, required by `notify 9.0.0-rc.4`.
 

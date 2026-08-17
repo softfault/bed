@@ -19,6 +19,7 @@ const BEGIN_SYNCHRONIZED_UPDATE: &[u8] = b"\x1b[?2026h";
 const END_SYNCHRONIZED_UPDATE: &[u8] = b"\x1b[?2026l";
 
 mod child;
+mod frame;
 
 pub use child::{encode_child_key, encode_child_mouse};
 
@@ -157,6 +158,7 @@ pub struct TerminalSize {
 
 pub struct Terminal {
     platform: platform::PlatformTerminal,
+    frame_renderer: frame::FrameRenderer,
     input_claimed: bool,
 }
 
@@ -183,6 +185,7 @@ impl Terminal {
     pub fn new() -> Result<Self> {
         Ok(Self {
             platform: platform::PlatformTerminal::new()?,
+            frame_renderer: frame::FrameRenderer::default(),
             input_claimed: false,
         })
     }
@@ -227,6 +230,23 @@ impl Terminal {
     }
 
     pub fn draw(&mut self, bytes: &[u8]) -> Result<()> {
+        self.frame_renderer.reset();
+        self.draw_synchronized(bytes)
+    }
+
+    /// Draws a complete logical frame using retained cell-level updates.
+    ///
+    /// The first frame and frames after a resize are emitted unchanged. Later
+    /// frames update only changed cell runs and cursor state.
+    pub fn draw_frame(&mut self, bytes: &[u8], size: TerminalSize) -> Result<()> {
+        let output = self.frame_renderer.render(bytes, size);
+        if output.is_empty() {
+            return Ok(());
+        }
+        self.draw_synchronized(&output)
+    }
+
+    fn draw_synchronized(&mut self, bytes: &[u8]) -> Result<()> {
         let mut output = Vec::with_capacity(
             BEGIN_SYNCHRONIZED_UPDATE.len() + bytes.len() + END_SYNCHRONIZED_UPDATE.len(),
         );

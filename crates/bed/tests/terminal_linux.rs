@@ -275,7 +275,8 @@ fn edits_resizes_and_restores_a_real_pseudo_terminal() -> io::Result<()> {
     terminal.wait_for_raw_mode()?;
     terminal.wait_for_frame()?;
     terminal.resize(30, 100)?;
-    terminal.wait_for_frame()?;
+    let resized = terminal.wait_for_frame()?;
+    assert!(contains(&resized, b"\x1b[2J"));
     terminal.write_input("ihello好\x1b:wq\r".as_bytes())?;
 
     terminal.wait_for_output(b"\x1b[?25h\x1b[?1006l\x1b[?1003l\x1b[?2004l\x1b[?1049l\x1b[0 q")?;
@@ -283,6 +284,33 @@ fn edits_resizes_and_restores_a_real_pseudo_terminal() -> io::Result<()> {
     assert!(status.success());
     assert_eq!(fs::read(&path.0)?, "hello好".as_bytes());
     assert_eq!(terminal.termios()?, original);
+    Ok(())
+}
+
+#[test]
+fn ordinary_redraws_do_not_clear_the_terminal_screen() -> io::Result<()> {
+    let path = TempPath::new();
+    fs::write(&path.0, b"abc")?;
+    let mut terminal = PseudoTerminal::new(24, 80)?;
+    let child = terminal.spawn(&path.0)?;
+
+    terminal.wait_for_raw_mode()?;
+    let initial = terminal.wait_for_frame()?;
+    assert!(contains(&initial, b"\x1b[2J"));
+    for _ in 0..20 {
+        if terminal.collect_for(Duration::from_millis(25))?.is_empty() {
+            break;
+        }
+    }
+
+    terminal.write_input(b"l")?;
+    let update = terminal.wait_for_output(b"\x1b[?2026l")?;
+    assert!(!contains(&update, b"\x1b[2J"));
+    assert!(update.len() < initial.len());
+
+    terminal.write_input(b":q!\r")?;
+    terminal.wait_for_output(b"\x1b[?25h\x1b[?1006l\x1b[?1003l\x1b[?2004l\x1b[?1049l\x1b[0 q")?;
+    assert!(child.wait()?.success());
     Ok(())
 }
 

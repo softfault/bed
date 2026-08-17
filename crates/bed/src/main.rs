@@ -17,7 +17,7 @@ fn main() -> Result<()> {
     while !app.should_quit() {
         if redraw {
             let frame = app.render(size);
-            terminal.draw(&frame)?;
+            terminal.draw_frame(&frame, size)?;
             redraw = false;
         }
         let batch = events.next_batch(Duration::from_millis(16))?;
